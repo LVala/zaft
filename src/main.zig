@@ -1,15 +1,19 @@
 const std = @import("std");
 const xev = @import("xev");
 const zaft = @import("zaft.zig");
+const RPC = @import("rpc.zig").RPC;
 
-const ips = [_][]const u8{ "127.0.0.1", "127.0.0.1", "127.0.0.1" };
-const ports = [_]u16{ 10001, 10002, 10003 };
+const addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001", "127.0.0.1:10002" };
+
+const UserData = struct {
+    rpcs: []RPC,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
+    const allocator = gpa.allocator();
 
-    var args = try std.process.argsWithAllocator(alloc);
+    var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
     _ = args.next();
@@ -18,65 +22,61 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var c_accept: xev.Completion = undefined;
-
-    var socket: xev.TCP = undefined;
-    server.accept(&loop, &c_accept, xev.TCP, &socket, acceptCallback);
-
-    const w = try xev.Timer.init();
-    defer w.deinit();
-
-    var c: xev.Completion = undefined;
-    w.run(&loop, &c, 5000, void, null, &timerCallback);
-
-    try loop.run(.until_done);
-
-    // std.debug.print("KONIEC\n", .{});
-    //
-    // const send_buf = "12345\n";
-    // var c_write: xev.Completion = undefined;
-    // socket.write(&loop, &c_write, .{ .slice = send_buf }, void, null, writeCallback);
-    //
-    // try loop.run(.until_done);
-    //
-    // std.debug.print("REAL KONIEC\n", .{});
-}
-
-fn acceptCallback(ud: ?*xev.TCP, _: *xev.Loop, _: *xev.Completion, result: xev.TCP.AcceptError!xev.TCP) xev.CallbackAction {
-    _ = result catch unreachable;
-    if (result) |socket| {
-        ud.?.* = socket;
-        // var send_buf = [_]u8{ 1, 1, 2, 3, 5, 8, 14 };
-        // const send_buf = "12345\n";
-        // var c_write: xev.Completion = undefined;
-        // socket.write(loop, &c_write, .{ .slice = send_buf }, void, null, writeCallback);
-    } else |err| {
-        std.debug.print("Error accepting a TCP connection: {any}\n", .{err});
+    const rpcs = try allocator.alloc(RPC, addresses.len);
+    for (addresses, 0..) |address, id| {
+        if (id == self_id) {
+            rpcs[id] = undefined;
+        } else {
+            const rpc = try RPC.init(address, &loop, allocator);
+            rpcs[id] = rpc;
+        }
     }
 
-    std.debug.print("CON ACCEPTED\n", .{});
+    const self_address = try std.net.Address.parseIp4("127.0.0.1", 10000);
+    const server = try xev.TCP.init(self_address);
+    try server.bind(self_address);
+    try server.listen(1);
 
+    var read_buffer: [1024]u8 = undefined;
+    var siema: []u8 = &read_buffer;
+    var c_accept: xev.Completion = undefined;
+    server.accept(&loop, &c_accept, []u8, &siema, acceptCallback);
+
+    // const w = try xev.Timer.init();
+    // defer w.deinit();
+    //
+    // var completion: xev.Completion = undefined;
+    // w.run(&loop, &completion, 1000, RPC, &rpc, &timerCallback);
+
+    try loop.run(.until_done);
+}
+
+fn acceptCallback(_: ?*[]u8, _: *xev.Loop, _: *xev.Completion, result: xev.TCP.AcceptError!xev.TCP) xev.CallbackAction {
+    _ = result catch |err| {
+        std.debug.print("Accepting connection failed: {any}", err);
+        return .rearm;
+    };
+
+    // server.read();
+    //
     return .disarm;
 }
 
-fn writeCallback(_: ?*void, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.WriteBuffer, result: xev.TCP.WriteError!usize) xev.CallbackAction {
-    std.debug.print("DATA SEND {any}\n", .{result});
+fn timerCallback(
+    rpc: ?*RPC,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = result catch unreachable;
+    // QUESTION: is this the right thing to do?
+    // .rearm runs the callback instantly, withouth the delay
+    const w = try xev.Timer.init();
+    defer w.deinit();
 
-    return .rearm;
+    w.run(loop, completion, 1000, RPC, rpc, &timerCallback);
+
+    rpc.?.call("siemanko\n") catch unreachable;
+
+    return .disarm;
 }
-
-// fn timerCallback(
-//     userdata: ?*void,
-//     loop: *xev.Loop,
-//     c: *xev.Completion,
-//     result: xev.Timer.RunError!void,
-// ) xev.CallbackAction {
-//     _ = userdata;
-//     _ = loop;
-//     _ = c;
-//     _ = result catch unreachable;
-//
-//     std.debug.print("Siema z petli\n", .{});
-//
-//     return .disarm;
-// }
