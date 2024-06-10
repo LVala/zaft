@@ -1,8 +1,67 @@
 const std = @import("std");
 const xev = @import("xev");
 
-// TODO: RPC is a bit of a overstatement
-pub const RPC = struct {
+pub const Receiver = struct {
+    address: std.net.Address,
+    allocator: std.mem.Allocator,
+    loop: *xev.Loop,
+    server: xev.TCP,
+    completion: xev.Completion = undefined,
+
+    const Self = @This();
+    const buffer_size = 1024;
+
+    pub fn init(raw_address: []const u8, loop: *xev.Loop, allocator: std.mem.Allocator) !Self {
+        const address = try parseAddress(raw_address);
+        const server = try xev.TCP.init(address);
+
+        return Self{
+            .address = address,
+            .allocator = allocator,
+            .loop = loop,
+            .server = server,
+        };
+    }
+
+    pub fn listen(self: *Self) !void {
+        try self.server.bind(self.address);
+        try self.server.listen(1);
+        self.server.accept(self.loop, &self.completion, Self, self, Self.acceptCallback);
+
+        std.debug.print("Listening on {}\n", .{self.address});
+    }
+
+    fn acceptCallback(self: ?*Self, loop: *xev.Loop, _: *xev.Completion, result: xev.TCP.AcceptError!xev.TCP) xev.CallbackAction {
+        const server = result catch |err| {
+            std.debug.print("Accepting connection on {any} failed: {any}\n", .{ self.?.address, err });
+            return .rearm;
+        };
+
+        // TODO: handle errors nicely
+        const completion = self.?.allocator.create(xev.Completion) catch unreachable;
+        const buffer = self.?.allocator.alloc(u8, buffer_size) catch unreachable;
+
+        server.read(loop, completion, .{ .slice = buffer }, Self, self, readCallback);
+
+        return .rearm;
+    }
+
+    fn readCallback(self: ?*Self, _: *xev.Loop, completion: *xev.Completion, _: xev.TCP, buffer: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
+        _ = result catch |err| {
+            std.debug.print("Reading on {any} failed: {any}\n", .{ self.?.address, err });
+            self.?.allocator.free(buffer.slice);
+            self.?.allocator.destroy(completion);
+            return .disarm;
+        };
+
+        // TODO: parse and feed the messages to Raft
+        std.debug.print("READ: {s}", .{buffer.slice});
+
+        return .rearm;
+    }
+};
+
+pub const Sender = struct {
     address: std.net.Address,
     allocator: std.mem.Allocator,
     loop: *xev.Loop,
@@ -20,12 +79,7 @@ pub const RPC = struct {
     const Self = @This();
 
     pub fn init(raw_address: []const u8, loop: *xev.Loop, allocator: std.mem.Allocator) !Self {
-        var it = std.mem.splitSequence(u8, raw_address, ":");
-
-        const ip = it.first();
-        const port = try std.fmt.parseInt(u16, it.rest(), 10);
-        const address = try std.net.Address.parseIp4(ip, port);
-
+        const address = try parseAddress(raw_address);
         const client = try xev.TCP.init(address);
 
         return Self{
@@ -36,7 +90,7 @@ pub const RPC = struct {
         };
     }
 
-    pub fn call(self: *Self, msg: []const u8) !void {
+    pub fn send(self: *Self, msg: []const u8) !void {
         // TODO: we could avoid allocations entirely, but this is simpler
         const pt = try self.allocator.alloc(u8, msg.len);
         @memcpy(pt, msg);
@@ -97,6 +151,13 @@ pub const RPC = struct {
 
         return .disarm;
     }
-
-    // TODO: tests
 };
+
+fn parseAddress(address: []const u8) !std.net.Address {
+    var it = std.mem.splitSequence(u8, address, ":");
+
+    const ip = it.first();
+    const port = try std.fmt.parseInt(u16, it.rest(), 10);
+
+    return std.net.Address.parseIp4(ip, port);
+}
