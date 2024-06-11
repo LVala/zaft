@@ -3,14 +3,37 @@ const std = @import("std");
 const RequestVote = struct {
     term: u32,
     candidate_id: u32,
-    lastLogIndex: u32,
-    lastLogTerm: u32,
+};
+
+const RequestVoteResult = struct {
+    term: u32,
+    vote_granted: bool,
+};
+
+const AppendEntries = struct {
+    term: u32,
+    leader_id: u32,
+};
+
+const AppendEntriesResult = struct {
+    term: u32,
+    success: bool,
+};
+
+const RPC = union(enum) {
+    append_entries: AppendEntries,
+    request_vote: RequestVote,
+};
+
+const RPCResult = union(enum) {
+    append_entries: AppendEntriesResult,
+    request_vote: RequestVoteResult,
 };
 
 pub fn Config(UserData: type) type {
     return struct {
         user_data: *UserData,
-        sendRequestVote: *const fn (user_data: *UserData, node_id: u32, msg: RequestVote) anyerror!void,
+        makeRPC: *const fn (user_data: *UserData, node_id: u32, rpc: RPC) anyerror!void,
     };
 }
 
