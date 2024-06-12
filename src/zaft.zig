@@ -1,54 +1,51 @@
 const std = @import("std");
 
-const RequestVote = struct {
+pub const RequestVote = struct {
     term: u32,
     candidate_id: u32,
 };
 
-const RequestVoteResult = struct {
-    term: u32,
-    vote_granted: bool,
-};
-
-const AppendEntries = struct {
+pub const AppendEntries = struct {
     term: u32,
     leader_id: u32,
 };
 
-const AppendEntriesResult = struct {
-    term: u32,
-    success: bool,
-};
-
-const RPC = union(enum) {
+pub const RPC = union(enum) {
     append_entries: AppendEntries,
     request_vote: RequestVote,
 };
 
-const RPCResult = union(enum) {
-    append_entries: AppendEntriesResult,
-    request_vote: RequestVoteResult,
-};
-
-pub fn Config(UserData: type) type {
+pub fn Callbacks(UserData: type) type {
     return struct {
         user_data: *UserData,
-        makeRPC: *const fn (user_data: *UserData, node_id: u32, rpc: RPC) anyerror!void,
+        makeRPC: *const fn (user_data: *UserData, id: u32, rpc: RPC) anyerror!void,
     };
 }
 
-const Raft = struct {
-    current_term: u32 = 0,
-    voted_for: ?u32 = null,
-    id: u32,
+pub fn Raft(UserData: type) type {
+    return struct {
+        callbacks: Callbacks(UserData),
+        current_term: u32 = 0,
+        voted_for: ?u32 = null,
+        id: u32,
 
-    const Self = @This();
+        const Self = @This();
 
-    pub fn init() Self {
-        return Self{ .id = 5 };
-    }
+        pub fn init(id: u32, callbacks: Callbacks(UserData)) Self {
+            return Self{
+                .callbacks = callbacks,
+                .id = id,
+            };
+        }
 
-    pub fn tick() void {
-        std.debug.print("Ticked!\n", .{});
-    }
-};
+        pub fn tick() void {
+            std.debug.print("Ticked!\n", .{});
+        }
+
+        pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
+            _ = self;
+            _ = rpc;
+            std.debug.print("Handled from {d}!\n", .{id});
+        }
+    };
+}

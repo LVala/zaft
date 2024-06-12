@@ -47,18 +47,28 @@ pub const Receiver = struct {
     }
 
     fn readCallback(self: ?*Self, _: *xev.Loop, completion: *xev.Completion, _: xev.TCP, buffer: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
-        _ = result catch |err| {
+        const len = result catch |err| {
             std.debug.print("Reading on {any} failed: {any}\n", .{ self.?.address, err });
             self.?.allocator.free(buffer.slice);
             self.?.allocator.destroy(completion);
             return .disarm;
         };
 
-        // TODO: parse and feed the messages to Raft
-        std.debug.print("READ: {s}", .{buffer.slice});
+        const jason = std.json.parseFromSlice(Jason, self.?.allocator, buffer.slice[0..len], .{ .allocate = .alloc_always }) catch |err| {
+            std.debug.print("UNABLE: {any}\n", .{err});
+            return .rearm;
+        };
+        defer jason.deinit();
+
+        std.debug.print("JSON: {any}\n", .{jason.value});
 
         return .rearm;
     }
+};
+
+pub const Jason = struct {
+    hello: u32,
+    hi: []const u8,
 };
 
 pub const Sender = struct {

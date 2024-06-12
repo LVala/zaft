@@ -5,8 +5,7 @@ const network = @import("network.zig");
 
 const addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001", "127.0.0.1:10002" };
 
-const Siema = struct {
-    self_id: u32,
+const UserData = struct {
     senders: []network.Sender,
 };
 
@@ -23,10 +22,9 @@ pub fn main() !void {
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var receiver = try network.Receiver.init(addresses[self_id], &loop, allocator);
-    try receiver.listen();
-
     const senders = try allocator.alloc(network.Sender, addresses.len);
+    defer allocator.free(senders);
+
     for (addresses, 0..) |address, id| {
         if (id == self_id) {
             senders[id] = undefined;
@@ -36,34 +34,48 @@ pub fn main() !void {
         }
     }
 
-    var siema = Siema{ .self_id = self_id, .senders = senders };
+    var user_data = UserData{ .senders = senders };
+    const callbacks = zaft.Callbacks(UserData){
+        .user_data = &user_data,
+        .makeRPC = makeRPC,
+    };
+    const raft = zaft.Raft(UserData).init(self_id, callbacks);
 
-    const timer = try xev.Timer.init();
-    defer timer.deinit();
+    var receiver = try network.Receiver.init(addresses[self_id], &loop, &raft, allocator);
+    try receiver.listen();
 
-    var completion: xev.Completion = undefined;
-    timer.run(&loop, &completion, 5000, Siema, &siema, timerCallback);
+    // const timer = try xev.Timer.init();
+    // defer timer.deinit();
+    //
+    // var completion: xev.Completion = undefined;
+    // timer.run(&loop, &completion, 5000, Siema, &siema, timerCallback);
 
     try loop.run(.until_done);
 }
 
-fn timerCallback(
-    siema: ?*Siema,
-    loop: *xev.Loop,
-    c: *xev.Completion,
-    result: xev.Timer.RunError!void,
-) xev.CallbackAction {
-    for (siema.?.senders, 0..) |*sender, id| {
-        if (id == siema.?.self_id) continue;
-
-        sender.send("siemanko\n") catch |err| {
-            std.debug.print("ERROR sending: {any}\n", .{err});
-        };
-    }
-
-    _ = loop;
-    _ = c;
-    _ = result catch unreachable;
-    std.debug.print("hello\n", .{});
-    return .disarm;
+fn makeRPC(user_data: *UserData, id: u32, rpc: zaft.RPC) !void {
+    _ = user_data;
+    _ = rpc;
+    std.debug.print("MAKING RPC to {d}...\n", .{id});
 }
+
+// fn timerCallback(
+//     siema: ?*Siema,
+//     loop: *xev.Loop,
+//     c: *xev.Completion,
+//     result: xev.Timer.RunError!void,
+// ) xev.CallbackAction {
+//     for (siema.?.senders, 0..) |*sender, id| {
+//         if (id == siema.?.self_id) continue;
+//
+//         sender.send("{\"hello\":5,\"hi\":\"yooooo\"}") catch |err| {
+//             std.debug.print("ERROR sending: {any}\n", .{err});
+//         };
+//     }
+//
+//     _ = loop;
+//     _ = c;
+//     _ = result catch unreachable;
+//     std.debug.print("hello\n", .{});
+//     return .disarm;
+// }
