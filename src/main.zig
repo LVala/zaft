@@ -39,43 +39,37 @@ pub fn main() !void {
         .user_data = &user_data,
         .makeRPC = makeRPC,
     };
-    const raft = zaft.Raft(UserData).init(self_id, callbacks);
+    var raft = zaft.Raft(UserData).init(self_id, callbacks);
 
-    var receiver = try network.Receiver.init(addresses[self_id], &loop, &raft, allocator);
+    var receiver = try network.Receiver(UserData).init(addresses[self_id], &loop, &raft, allocator);
     try receiver.listen();
 
-    // const timer = try xev.Timer.init();
-    // defer timer.deinit();
-    //
-    // var completion: xev.Completion = undefined;
-    // timer.run(&loop, &completion, 5000, Siema, &siema, timerCallback);
+    const timer = try xev.Timer.init();
+    defer timer.deinit();
+
+    var completion: xev.Completion = undefined;
+    timer.run(&loop, &completion, 1000, zaft.Raft(UserData), &raft, timerCallback);
 
     try loop.run(.until_done);
 }
 
 fn makeRPC(user_data: *UserData, id: u32, rpc: zaft.RPC) !void {
-    _ = user_data;
-    _ = rpc;
-    std.debug.print("MAKING RPC to {d}...\n", .{id});
+    try user_data.senders[id].send(rpc);
 }
 
-// fn timerCallback(
-//     siema: ?*Siema,
-//     loop: *xev.Loop,
-//     c: *xev.Completion,
-//     result: xev.Timer.RunError!void,
-// ) xev.CallbackAction {
-//     for (siema.?.senders, 0..) |*sender, id| {
-//         if (id == siema.?.self_id) continue;
-//
-//         sender.send("{\"hello\":5,\"hi\":\"yooooo\"}") catch |err| {
-//             std.debug.print("ERROR sending: {any}\n", .{err});
-//         };
-//     }
-//
-//     _ = loop;
-//     _ = c;
-//     _ = result catch unreachable;
-//     std.debug.print("hello\n", .{});
-//     return .disarm;
-// }
+fn timerCallback(
+    raft: ?*zaft.Raft(UserData),
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = result catch unreachable;
+
+    raft.?.tick();
+
+    const timer = try xev.Timer.init();
+    defer timer.deinit();
+
+    timer.run(loop, completion, 1000, zaft.Raft(UserData), raft.?, timerCallback);
+    return .disarm;
+}

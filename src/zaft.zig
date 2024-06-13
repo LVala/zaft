@@ -38,14 +38,17 @@ pub fn Raft(UserData: type) type {
             };
         }
 
-        pub fn tick() void {
+        pub fn tick(self: *Self) void {
             std.debug.print("Ticked!\n", .{});
+
+            const rpc = RPC{ .request_vote = RequestVote{ .term = 500, .candidate_id = 100 } };
+            const to: u32 = if (self.id == 1) 0 else 1;
+            self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch unreachable;
         }
 
-        pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
+        pub fn handleRPC(self: *Self, rpc: RPC) void {
             _ = self;
-            _ = rpc;
-            std.debug.print("Handled from {d}!\n", .{id});
+            std.debug.print("Handled {any}!\n", .{rpc});
         }
     };
 }
