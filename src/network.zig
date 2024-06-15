@@ -148,7 +148,9 @@ pub const Sender = struct {
         self.?.client = client;
 
         if (result) |bytes| {
-            std.debug.print("Succesfully send {d} bytes to {any}\n", .{ bytes, self.?.address });
+            if (bytes > self.?.send_buffer.len) {
+                std.debug.print("Received message is too long ({d} > {d})\n", .{ bytes, self.?.send_buffer.len });
+            }
         } else |err| {
             std.debug.print("Sending to {any} failed: {any}\n", .{ self.?.address, err });
             // TODO: take care of this unreachable and handle closing the socket

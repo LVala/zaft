@@ -3,7 +3,7 @@ const xev = @import("xev");
 const zaft = @import("zaft.zig");
 const network = @import("network.zig");
 
-const addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001", "127.0.0.1:10002" };
+const addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001" };
 
 const UserData = struct {
     senders: []network.Sender,
@@ -39,7 +39,7 @@ pub fn main() !void {
         .user_data = &user_data,
         .makeRPC = makeRPC,
     };
-    var raft = zaft.Raft(UserData).init(self_id, callbacks);
+    var raft = zaft.Raft(UserData).init(self_id, addresses.len, callbacks);
 
     var receiver = try network.Receiver(UserData).init(addresses[self_id], &loop, &raft, allocator);
     try receiver.listen();
@@ -48,7 +48,7 @@ pub fn main() !void {
     defer timer.deinit();
 
     var completion: xev.Completion = undefined;
-    timer.run(&loop, &completion, 1000, zaft.Raft(UserData), &raft, timerCallback);
+    timer.run(&loop, &completion, 0, zaft.Raft(UserData), &raft, timerCallback);
 
     try loop.run(.until_done);
 }
@@ -65,11 +65,11 @@ fn timerCallback(
 ) xev.CallbackAction {
     _ = result catch unreachable;
 
-    raft.?.tick();
+    const next_ms = raft.?.tick();
 
     const timer = try xev.Timer.init();
     defer timer.deinit();
 
-    timer.run(loop, completion, 1000, zaft.Raft(UserData), raft.?, timerCallback);
+    timer.run(loop, completion, next_ms, zaft.Raft(UserData), raft.?, timerCallback);
     return .disarm;
 }
