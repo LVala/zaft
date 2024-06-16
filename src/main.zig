@@ -73,3 +73,8 @@ fn timerCallback(
     timer.run(loop, completion, next_ms, zaft.Raft(UserData), raft.?, timerCallback);
     return .disarm;
 }
+
+test {
+    // temporary, its going to be removed when main/networking are moved to kv_store example
+    _ = zaft.Raft(u32);
+}

@@ -46,11 +46,13 @@ pub fn Raft(UserData: type) type {
         id: u32,
         server_no: u32,
 
+        state: State,
+        timeout: u64,
+
         current_term: u32 = 0,
         voted_for: ?u32 = null,
 
-        state: State,
-        timeout: u64,
+        // candidate-specific
         votes: u32 = 0,
 
         pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData)) Self {
@@ -154,7 +156,6 @@ pub fn Raft(UserData: type) type {
                     break :blk false;
                 }
 
-                // TODO: also check if log is up-to-data
                 if (self.voted_for == null or self.voted_for == msg.candidate_id) {
                     // TODO: also check if log is up-to-data
                     break :blk true;
@@ -215,4 +216,48 @@ pub fn Raft(UserData: type) type {
 fn getTime() u64 {
     const time_ms = std.time.milliTimestamp();
     return @intCast(time_ms);
+}
+
+test "successful election" {
+    const server_no: u32 = 3;
+    var rpcs: [server_no]RPC = undefined;
+    const callbacks = Callbacks([3]RPC){ .user_data = &rpcs, .makeRPC = struct {
+        pub fn makeRPC(ud: *[server_no]RPC, id: u32, rpc: RPC) !void {
+            ud.*[id] = rpc;
+        }
+    }.makeRPC };
+
+    const self_id = 0;
+    var raft = Raft([server_no]RPC).init(self_id, server_no, callbacks);
+    // nothing should happen after initial tick, it's to early for election timeout
+    _ = raft.tick();
+
+    const initial_term = raft.current_term;
+
+    try std.testing.expect(raft.state == .follower);
+
+    // we forcefully overwrite the timeout for testing purposes
+    raft.timeout = getTime() - 1;
+
+    _ = raft.tick();
+
+    // new election should start
+    try std.testing.expect(raft.state == .candidate);
+    try std.testing.expect(raft.current_term == initial_term + 1);
+    for (rpcs, 0..) |rpc, idx| {
+        if (idx == self_id) continue;
+        // candidate should send RequestVote to all other servers
+        switch (rpc) {
+            .request_vote => |rv| {
+                try std.testing.expect(rv.term == initial_term + 1);
+                try std.testing.expect(rv.candidate_id == self_id);
+            },
+            else => {
+                // is there a nicer way to do that?
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // TODO
 }
