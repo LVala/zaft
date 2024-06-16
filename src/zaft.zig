@@ -40,6 +40,7 @@ pub fn Raft(UserData: type) type {
         const Self = @This();
 
         const default_timeout = 1000;
+        const heartbeat_timeout = 500;
 
         callbacks: Callbacks(UserData),
         id: u32,
@@ -53,6 +54,8 @@ pub fn Raft(UserData: type) type {
         votes: u32 = 0,
 
         pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData)) Self {
+            std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
+
             const time = getTime();
             return Self{
                 .callbacks = callbacks,
@@ -67,28 +70,24 @@ pub fn Raft(UserData: type) type {
             const time = getTime();
             if (self.timeout > time) {
                 // too early!
-                return self.timeout - time;
+                const remaining = self.timeout - time;
+                return if (self.state == .follower) remaining else @min(remaining, heartbeat_timeout);
             }
 
-            self.timeout = switch (self.state) {
-                .leader => blk: {
-                    self.sendHeartbeat();
-                    break :blk newHeartbeatTimeout(time);
-                },
-                else => blk: {
-                    self.convertToCandidate();
-                    // TODO: when entering the leader state
-                    // the timeout between first and second heartbeat
-                    // because of the last returned value when still
-                    // in the candidate state
-                    break :blk newElectionTimeout(time);
-                },
-            };
+            switch (self.state) {
+                .leader => self.sendHeartbeat(time),
+                else => self.convertToCandidate(time),
+            }
 
-            return self.timeout - time;
+            // return min(remaining time, hearteat_timeout), even when
+            // we aren't the leader (we might get elected quickly, and thus cannot
+            // wait for the whole election_timeout to start sending hearbeats)
+            return @min(self.timeout - time, heartbeat_timeout);
         }
 
-        fn sendHeartbeat(self: *Self) void {
+        fn sendHeartbeat(self: *Self, time: u64) void {
+            std.log.info("Sending heartbeat\n", .{});
+
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
 
@@ -99,17 +98,20 @@ pub fn Raft(UserData: type) type {
                 const rpc = .{ .append_entries = request_vote };
 
                 self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
-                    std.debug.print("makeRPC failed: {}\n", .{err});
+                    std.log.warn("Sending heartbeat to server {d} failed: {any}\n", .{ idx, err });
                 };
             }
+
+            self.timeout = newHeartbeatTimeout(time);
         }
 
-        fn convertToCandidate(self: *Self) void {
-            std.debug.print("Converted to candidate\n", .{});
+        fn convertToCandidate(self: *Self, time: u64) void {
             self.current_term += 1;
             self.state = .candidate;
             self.voted_for = self.id;
             self.votes = 1;
+
+            std.log.info("Starting new election, term: {d}\n", .{self.current_term});
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
@@ -121,9 +123,18 @@ pub fn Raft(UserData: type) type {
                 const rpc = .{ .request_vote = request_vote };
 
                 self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
-                    std.debug.print("makeRPC failed: {}\n", .{err});
+                    std.log.warn("Sending RequestVote to server {d} failed: {any}\n", .{ idx, err });
                 };
             }
+
+            self.timeout = newElectionTimeout(time);
+        }
+
+        fn convertToLeader(self: *Self) void {
+            std.log.info("Converted to leader\n", .{});
+
+            self.state = .leader;
+            self.sendHeartbeat(getTime());
         }
 
         pub fn handleRPC(self: *Self, rpc: RPC) void {
@@ -138,7 +149,6 @@ pub fn Raft(UserData: type) type {
         }
 
         fn handleRequestVote(self: *Self, msg: RequestVote) void {
-            std.debug.print("Received request vote from {d}\n", .{msg.candidate_id});
             const vote_granted = blk: {
                 if (msg.term < self.current_term) {
                     break :blk false;
@@ -158,39 +168,30 @@ pub fn Raft(UserData: type) type {
                 .vote_granted = vote_granted,
             };
 
-            std.debug.print("Granting vote to {d}: {any}\n", .{ msg.candidate_id, vote_granted });
+            std.log.info("Received RequestVote from server {d} with term {d}, vote_granted: {any}\n", .{ msg.candidate_id, msg.term, vote_granted });
 
             const rpc = .{ .request_vote_response = response };
             self.callbacks.makeRPC(self.callbacks.user_data, msg.candidate_id, rpc) catch |err| {
-                std.debug.print("makeRPC failed: {}\n", .{err});
+                std.log.warn("Sending RequestVoteResponse to server {d}, failed: {any}\n", .{ msg.candidate_id, err });
             };
 
             self.timeout = newElectionTimeout(getTime());
         }
 
         fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse) void {
-            std.debug.print("Received {any} request vote response\n", .{msg.vote_granted});
-
             // TODO: probably should verify who is the response from to ignore duplicates
             if (self.state != .candidate) return;
             if (msg.vote_granted) self.votes += 1;
 
-            std.debug.print("Votes {d}, servers {d}\n", .{ self.votes, self.server_no });
+            std.log.info("Received RequestVoteResponse, vote_granted: {any}, total votes: {d}\n", .{ msg.vote_granted, self.votes });
 
-            if (self.votes >= self.server_no / 2 + 1) {
-                // we received the majority of the votes
-                self.state = .leader;
-                self.sendHeartbeat();
-                self.timeout = newHeartbeatTimeout(getTime());
-                std.debug.print("WE ARE LEADER\n", .{});
-            }
+            if (self.votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
 
         fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
-            std.debug.print("Received AppendEntries\n", .{});
+            std.log.info("Received AppendEntries from server {d}\n", .{msg.leader_id});
             self.state = .follower;
             self.timeout = newElectionTimeout(getTime());
-            _ = msg;
         }
 
         fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse) void {
@@ -206,8 +207,7 @@ pub fn Raft(UserData: type) type {
         }
 
         fn newHeartbeatTimeout(time: u64) u64 {
-            // TODO
-            return time + 500;
+            return time + heartbeat_timeout;
         }
     };
 }
