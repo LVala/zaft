@@ -218,39 +218,42 @@ fn getTime() u64 {
     return @intCast(time_ms);
 }
 
-test "successful election" {
-    const server_no: u32 = 3;
-    var rpcs: [server_no]RPC = undefined;
-    const callbacks = Callbacks([3]RPC){ .user_data = &rpcs, .makeRPC = struct {
-        pub fn makeRPC(ud: *[server_no]RPC, id: u32, rpc: RPC) !void {
+// TESTS
+
+fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC) Raft([len]RPC) {
+    const callbacks = Callbacks([len]RPC){ .user_data = rpcs, .makeRPC = struct {
+        pub fn makeRPC(ud: *[len]RPC, id: u32, rpc: RPC) !void {
             ud.*[id] = rpc;
         }
     }.makeRPC };
 
-    const self_id = 0;
-    var raft = Raft([server_no]RPC).init(self_id, server_no, callbacks);
+    // our raft always gets the id 0
+    return Raft([len]RPC).init(0, len, callbacks);
+}
+
+test "successful election" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs);
+    const initial_term = raft.current_term;
+
     // nothing should happen after initial tick, it's to early for election timeout
     _ = raft.tick();
-
-    const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .follower);
 
     // we forcefully overwrite the timeout for testing purposes
     raft.timeout = getTime() - 1;
-
     _ = raft.tick();
 
     // new election should start
     try std.testing.expect(raft.state == .candidate);
     try std.testing.expect(raft.current_term == initial_term + 1);
-    for (rpcs, 0..) |rpc, idx| {
-        if (idx == self_id) continue;
+    for (rpcs[1..]) |rpc| {
         // candidate should send RequestVote to all other servers
         switch (rpc) {
             .request_vote => |rv| {
                 try std.testing.expect(rv.term == initial_term + 1);
-                try std.testing.expect(rv.candidate_id == self_id);
+                try std.testing.expect(rv.candidate_id == 0);
             },
             else => {
                 // is there a nicer way to do that?
@@ -259,5 +262,57 @@ test "successful election" {
         }
     }
 
-    // TODO
+    // simulate other servers giving the vote to the candidate
+    const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    // no majority => still a candidate
+    try std.testing.expect(raft.state == .candidate);
+
+    const rvr2 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = false };
+    raft.handleRPC(RPC{ .request_vote_response = rvr2 });
+    // vote not granted => still a candidate
+    try std.testing.expect(raft.state == .candidate);
+
+    // TODO: not implemented but should be eventually tested
+    // const rvr3 = RequestVoteResponse{ .term = initial_term, .vote_granted = true };
+    // raft.handleRPC(RPC{ .request_vote_response = rvr3 });
+    // // stale message => still a candidate
+    // try std.testing.expect(raft.state == .candidate);
+
+    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    try std.testing.expect(raft.state == .leader);
+
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    // the leader itself won't ever stop being the leader without outside action
+    try std.testing.expect(raft.state == .leader);
+}
+
+test "failed election" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs);
+    const initial_term = raft.current_term;
+
+    try std.testing.expect(raft.state == .follower);
+
+    // skip timeout for testing purposes
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    // first election should start
+    try std.testing.expect(raft.state == .candidate);
+    try std.testing.expect(raft.current_term == initial_term + 1);
+
+    const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    try std.testing.expect(raft.state == .candidate);
+
+    // candidate did not receive majority of the votes
+    // => new election should start after the timeout
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    try std.testing.expect(raft.state == .candidate);
+    try std.testing.expect(raft.current_term == initial_term + 2);
 }
