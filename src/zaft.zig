@@ -3,6 +3,10 @@ const std = @import("std");
 pub const AppendEntries = struct {
     term: u32,
     leader_id: u32,
+    // prev_log_index: u32,
+    // prev_log_term: u32,
+    // entries: []u32,
+    // leader_commit: u32,
 };
 
 pub const AppendEntriesResponse = struct {
@@ -13,6 +17,8 @@ pub const AppendEntriesResponse = struct {
 pub const RequestVote = struct {
     term: u32,
     candidate_id: u32,
+    // last_log_index: u32,
+    // last_log_term: u32,
 };
 
 pub const RequestVoteResponse = struct {
@@ -43,6 +49,7 @@ pub fn Raft(UserData: type) type {
         const heartbeat_timeout = 500;
 
         callbacks: Callbacks(UserData),
+        allocator: std.mem.Allocator,
         id: u32,
         server_no: u32,
 
@@ -51,21 +58,39 @@ pub fn Raft(UserData: type) type {
 
         current_term: u32 = 0,
         voted_for: ?u32 = null,
+        log: std.ArrayList(u32),
+
+        commit_index: u32 = 0,
+        last_applied: u32 = 0,
+
+        // leader-specific
+        next_index: []u32,
+        match_index: []u32,
 
         // candidate-specific
         votes: u32 = 0,
 
-        pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData)) Self {
+        pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData), allocator: std.mem.Allocator) !Self {
             std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
 
             const time = getTime();
             return Self{
                 .callbacks = callbacks,
+                .allocator = allocator,
                 .id = id,
                 .server_no = server_no,
                 .state = .follower,
                 .timeout = newElectionTimeout(time),
+                .log = std.ArrayList(u32).init(allocator),
+                .next_index = try allocator.alloc(u32, server_no),
+                .match_index = try allocator.alloc(u32, server_no),
             };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.log.deinit();
+            self.allocator.free(self.next_index);
+            self.allocator.free(self.match_index);
         }
 
         pub fn tick(self: *Self) u64 {
@@ -85,6 +110,15 @@ pub fn Raft(UserData: type) type {
             // we aren't the leader (we might get elected quickly, and thus cannot
             // wait for the whole election_timeout to start sending hearbeats)
             return @min(self.timeout - time, heartbeat_timeout);
+        }
+
+        pub fn appendEntry(self: *Self, entry: u32) void {
+            _ = self;
+            _ = entry;
+
+            // 1. If not a leader => redirect
+            // 2. add the entry to the log
+            // 3. Send appendEntries to others
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
@@ -112,6 +146,7 @@ pub fn Raft(UserData: type) type {
             self.state = .candidate;
             self.voted_for = self.id;
             self.votes = 1;
+            // TODO: persist `current_term` and `voted_for`
 
             std.log.info("Starting new election, term: {d}\n", .{self.current_term});
 
@@ -136,12 +171,23 @@ pub fn Raft(UserData: type) type {
             std.log.info("Converted to leader\n", .{});
 
             self.state = .leader;
+            for (self.next_index, self.match_index) |*ni, *mi| {
+                // TODO proper initialization
+                ni.* = 420;
+                mi.* = 0;
+            }
+
             self.sendHeartbeat(getTime());
         }
 
+        fn convertToFollower(self: *Self) void {
+            std.log.info("Converted to follower\n", .{});
+
+            self.state = .follower;
+            self.timeout = newElectionTimeout(getTime());
+        }
+
         pub fn handleRPC(self: *Self, rpc: RPC) void {
-            // TODO: if term in the rpc is > self.current_term
-            // revert back to follower
             switch (rpc) {
                 .request_vote => |msg| self.handleRequestVote(msg),
                 .request_vote_response => |msg| self.handleRequestVoteResponse(msg),
@@ -151,6 +197,8 @@ pub fn Raft(UserData: type) type {
         }
 
         fn handleRequestVote(self: *Self, msg: RequestVote) void {
+            self.handleNewerTerm(msg.term);
+
             const vote_granted = blk: {
                 if (msg.term < self.current_term) {
                     break :blk false;
@@ -158,6 +206,8 @@ pub fn Raft(UserData: type) type {
 
                 if (self.voted_for == null or self.voted_for == msg.candidate_id) {
                     // TODO: also check if log is up-to-data
+                    self.voted_for = msg.candidate_id;
+                    // TODO: persist the `voted_for`
                     break :blk true;
                 }
 
@@ -180,6 +230,8 @@ pub fn Raft(UserData: type) type {
         }
 
         fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse) void {
+            self.handleNewerTerm(msg.term);
+
             // TODO: probably should verify who is the response from to ignore duplicates
             if (self.state != .candidate) return;
             if (msg.vote_granted) self.votes += 1;
@@ -190,14 +242,25 @@ pub fn Raft(UserData: type) type {
         }
 
         fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
+            self.handleNewerTerm(msg.term);
+
             std.log.info("Received AppendEntries from server {d}\n", .{msg.leader_id});
-            self.state = .follower;
-            self.timeout = newElectionTimeout(getTime());
+            // TODO
+            self.convertToFollower();
         }
 
         fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse) void {
-            _ = self;
-            _ = msg;
+            self.handleNewerTerm(msg.term);
+
+            std.log.info("Received AppendEntriesResponse\n", .{});
+            // TODO
+        }
+
+        fn handleNewerTerm(self: *Self, msg_term: u32) void {
+            if (msg_term > self.current_term) {
+                self.current_term = msg_term;
+                self.convertToFollower();
+            }
         }
 
         fn newElectionTimeout(time: u64) u64 {
@@ -228,7 +291,7 @@ fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft(
     }.makeRPC };
 
     // our Raft always gets the id 0
-    var raft = Raft([len]RPC).init(0, len, callbacks);
+    var raft = Raft([len]RPC).init(0, len, callbacks, std.testing.allocator) catch unreachable;
 
     if (!elect_leader) return raft;
 
@@ -246,6 +309,7 @@ fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft(
 test "successful election" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    defer raft.deinit();
     const initial_term = raft.current_term;
 
     // nothing should happen after initial tick, it's to early for election timeout
@@ -304,6 +368,7 @@ test "successful election" {
 test "failed election (timeout)" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    defer raft.deinit();
     const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .follower);
@@ -332,6 +397,7 @@ test "failed election (timeout)" {
 test "failed election (other server became the leader)" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    defer raft.deinit();
     const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .follower);
@@ -355,9 +421,60 @@ test "failed election (other server became the leader)" {
     try std.testing.expect(raft.current_term == initial_term + 1);
 }
 
+test "respond to RequestVote" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    defer raft.deinit();
+    const initial_term = raft.current_term;
+
+    // skip timeout, but do not tick yet
+    raft.timeout = getTime() - 1;
+
+    const cand1 = 3;
+    // TODO: is it possible for the candidate to have the same term as the followers?
+    // candidate increases its term when it becomes the candidate sooo ???
+    const rv1 = RequestVote{ .term = initial_term, .candidate_id = cand1 };
+    raft.handleRPC(.{ .request_vote = rv1 });
+
+    switch (rpcs[cand1]) {
+        .request_vote_response => |rvr| {
+            try std.testing.expect(rvr.vote_granted);
+            try std.testing.expect(rvr.term == initial_term);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    _ = raft.tick();
+
+    // its after the first timeout, but it should be extended by the RequestVote
+    try std.testing.expect(raft.state == .follower);
+    try std.testing.expect(raft.voted_for == cand1);
+
+    const cand2 = 1;
+    const rv2 = RequestVote{ .term = initial_term, .candidate_id = cand2 };
+    raft.handleRPC(.{ .request_vote = rv2 });
+
+    // already voted => this vote shouldn't be granted
+    switch (rpcs[cand2]) {
+        .request_vote_response => |rvr| {
+            try std.testing.expect(!rvr.vote_granted);
+            try std.testing.expect(rvr.term == initial_term);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    try std.testing.expect(raft.state == .follower);
+    try std.testing.expect(raft.voted_for == cand1);
+}
+
 test "leader sends heartbeats" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, true);
+    defer raft.deinit();
     const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .leader);
@@ -398,6 +515,7 @@ test "leader sends heartbeats" {
 test "follower respects heartbeats" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    defer raft.deinit();
 
     // skip timeout
     raft.timeout = getTime() - 1;
