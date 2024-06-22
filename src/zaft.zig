@@ -220,20 +220,32 @@ fn getTime() u64 {
 
 // TESTS
 
-fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC) Raft([len]RPC) {
+fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft([len]RPC) {
     const callbacks = Callbacks([len]RPC){ .user_data = rpcs, .makeRPC = struct {
         pub fn makeRPC(ud: *[len]RPC, id: u32, rpc: RPC) !void {
             ud.*[id] = rpc;
         }
     }.makeRPC };
 
-    // our raft always gets the id 0
-    return Raft([len]RPC).init(0, len, callbacks);
+    // our Raft always gets the id 0
+    var raft = Raft([len]RPC).init(0, len, callbacks);
+
+    if (!elect_leader) return raft;
+
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    for (1..len) |_| {
+        const rvr = RequestVoteResponse{ .term = raft.current_term, .vote_granted = true };
+        raft.handleRPC(.{ .request_vote_response = rvr });
+    }
+
+    return raft;
 }
 
 test "successful election" {
     var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs);
+    var raft = setupTestRaft(rpcs.len, &rpcs, false);
     const initial_term = raft.current_term;
 
     // nothing should happen after initial tick, it's to early for election timeout
@@ -291,7 +303,7 @@ test "successful election" {
 
 test "failed election" {
     var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs);
+    var raft = setupTestRaft(rpcs.len, &rpcs, false);
     const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .follower);
@@ -315,4 +327,61 @@ test "failed election" {
 
     try std.testing.expect(raft.state == .candidate);
     try std.testing.expect(raft.current_term == initial_term + 2);
+}
+
+test "leader sends heartbeats" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs, true);
+    const initial_term = raft.current_term;
+
+    try std.testing.expect(raft.state == .leader);
+
+    // initial AppendEntries heartbeat
+    for (rpcs[1..]) |rpc| {
+        switch (rpc) {
+            .append_entries => |ae| {
+                try std.testing.expect(ae.term == initial_term);
+                try std.testing.expect(ae.leader_id == 0);
+            },
+            else => {
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // clear messages (so we don't inspect stale messages later on)
+    rpcs = undefined;
+
+    // artificially skip timeout
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    for (rpcs[1..]) |rpc| {
+        switch (rpc) {
+            .append_entries => |ae| {
+                try std.testing.expect(ae.term == initial_term);
+                try std.testing.expect(ae.leader_id == 0);
+            },
+            else => {
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "follower respects heartbeats" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+
+    // skip timeout
+    raft.timeout = getTime() - 1;
+
+    const ae = AppendEntries{ .leader_id = 1, .term = raft.current_term };
+    raft.handleRPC(.{ .append_entries = ae });
+
+    try std.testing.expect(raft.state == .follower);
+    _ = raft.tick();
+
+    // append entries from leader => we should still be a follower after the tick
+    try std.testing.expect(raft.state == .follower);
 }
