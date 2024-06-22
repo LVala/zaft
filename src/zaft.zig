@@ -301,7 +301,7 @@ test "successful election" {
     try std.testing.expect(raft.state == .leader);
 }
 
-test "failed election" {
+test "failed election (timeout)" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
     const initial_term = raft.current_term;
@@ -327,6 +327,32 @@ test "failed election" {
 
     try std.testing.expect(raft.state == .candidate);
     try std.testing.expect(raft.current_term == initial_term + 2);
+}
+
+test "failed election (other server became the leader)" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    const initial_term = raft.current_term;
+
+    try std.testing.expect(raft.state == .follower);
+
+    // skip timeout for testing purposes
+    raft.timeout = getTime() - 1;
+    _ = raft.tick();
+
+    // first election should start
+    try std.testing.expect(raft.state == .candidate);
+    try std.testing.expect(raft.current_term == initial_term + 1);
+
+    const rvr = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(RPC{ .request_vote_response = rvr });
+    try std.testing.expect(raft.state == .candidate);
+
+    // received AppendEntries => sombody else become the leader
+    const ae = AppendEntries{ .term = initial_term + 1, .leader_id = 3 };
+    raft.handleRPC(RPC{ .append_entries = ae });
+    try std.testing.expect(raft.state == .follower);
+    try std.testing.expect(raft.current_term == initial_term + 1);
 }
 
 test "leader sends heartbeats" {
