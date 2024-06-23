@@ -17,8 +17,8 @@ pub const AppendEntriesResponse = struct {
 pub const RequestVote = struct {
     term: u32,
     candidate_id: u32,
-    // last_log_index: u32,
-    // last_log_term: u32,
+    last_log_index: u32,
+    last_log_term: u32,
 };
 
 pub const RequestVoteResponse = struct {
@@ -43,6 +43,8 @@ pub fn Callbacks(UserData: type) type {
 pub fn Raft(UserData: type) type {
     return struct {
         const State = enum { follower, candidate, leader };
+        // TODO: u32 is temporary
+        const LogEntry = struct { term: u32, entry: u32 };
         const Self = @This();
 
         const default_timeout = 1000;
@@ -56,9 +58,10 @@ pub fn Raft(UserData: type) type {
         state: State,
         timeout: u64,
 
+        // TODO: these need to be persisted after change
         current_term: u32 = 0,
         voted_for: ?u32 = null,
-        log: std.ArrayList(u32),
+        log: std.ArrayList(LogEntry),
 
         commit_index: u32 = 0,
         last_applied: u32 = 0,
@@ -68,7 +71,7 @@ pub fn Raft(UserData: type) type {
         match_index: []u32,
 
         // candidate-specific
-        votes: u32 = 0,
+        received_votes: []bool,
 
         pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData), allocator: std.mem.Allocator) !Self {
             std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
@@ -81,9 +84,10 @@ pub fn Raft(UserData: type) type {
                 .server_no = server_no,
                 .state = .follower,
                 .timeout = newElectionTimeout(time),
-                .log = std.ArrayList(u32).init(allocator),
+                .log = std.ArrayList(LogEntry).init(allocator),
                 .next_index = try allocator.alloc(u32, server_no),
                 .match_index = try allocator.alloc(u32, server_no),
+                .received_votes = try allocator.alloc(bool, server_no),
             };
         }
 
@@ -91,6 +95,7 @@ pub fn Raft(UserData: type) type {
             self.log.deinit();
             self.allocator.free(self.next_index);
             self.allocator.free(self.match_index);
+            self.allocator.free(self.received_votes);
         }
 
         pub fn tick(self: *Self) u64 {
@@ -113,12 +118,12 @@ pub fn Raft(UserData: type) type {
         }
 
         pub fn appendEntry(self: *Self, entry: u32) void {
-            _ = self;
-            _ = entry;
-
+            // TODO
             // 1. If not a leader => redirect
             // 2. add the entry to the log
             // 3. Send appendEntries to others
+
+            self.log.append(.{ .term = self.current_term, .entry = entry }) catch unreachable;
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
@@ -145,8 +150,10 @@ pub fn Raft(UserData: type) type {
             self.current_term += 1;
             self.state = .candidate;
             self.voted_for = self.id;
-            self.votes = 1;
-            // TODO: persist `current_term` and `voted_for`
+            for (self.received_votes) |*vote| {
+                vote.* = false;
+            }
+            self.received_votes[self.id] = true;
 
             std.log.info("Starting new election, term: {d}\n", .{self.current_term});
 
@@ -156,6 +163,9 @@ pub fn Raft(UserData: type) type {
                 const request_vote = RequestVote{
                     .term = self.current_term,
                     .candidate_id = self.id,
+                    .last_log_index = @intCast(self.log.items.len),
+                    // TODO: should we send 0 when theres not entries in the log?
+                    .last_log_term = if (self.log.getLastOrNull()) |last| last.term else 0,
                 };
                 const rpc = .{ .request_vote = request_vote };
 
@@ -184,15 +194,16 @@ pub fn Raft(UserData: type) type {
             std.log.info("Converted to follower\n", .{});
 
             self.state = .follower;
+            self.voted_for = null;
             self.timeout = newElectionTimeout(getTime());
         }
 
-        pub fn handleRPC(self: *Self, rpc: RPC) void {
+        pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
             switch (rpc) {
                 .request_vote => |msg| self.handleRequestVote(msg),
-                .request_vote_response => |msg| self.handleRequestVoteResponse(msg),
-                .append_entries => |msg| self.handleAppendEntries(msg),
-                .append_entries_response => |msg| self.handleAppendEntriesResponse(msg),
+                .request_vote_response => |msg| self.handleRequestVoteResponse(msg, id),
+                .append_entries => |msg| self.handleAppendEntries(msg, id),
+                .append_entries_response => |msg| self.handleAppendEntriesResponse(msg, id),
             }
         }
 
@@ -204,14 +215,25 @@ pub fn Raft(UserData: type) type {
                     break :blk false;
                 }
 
-                if (self.voted_for == null or self.voted_for == msg.candidate_id) {
-                    // TODO: also check if log is up-to-data
-                    self.voted_for = msg.candidate_id;
-                    // TODO: persist the `voted_for`
-                    break :blk true;
+                // ensure candidate's log is up-to-date
+                const last_term = if (self.log.getLastOrNull()) |last| last.term else 0;
+                if (msg.last_log_term < last_term) {
+                    break :blk false;
                 }
 
-                break :blk false;
+                if (msg.last_log_term == last_term and msg.last_log_index < self.log.items.len) {
+                    break :blk false;
+                }
+
+                // ensure we did not vote previously
+                // this should be false if we are not a follower
+                // as the leader and a candidate would vote for themselves already
+                if (self.voted_for != null and self.voted_for != msg.candidate_id) {
+                    break :blk false;
+                }
+
+                self.voted_for = msg.candidate_id;
+                break :blk true;
             };
 
             const response = RequestVoteResponse{
@@ -229,19 +251,22 @@ pub fn Raft(UserData: type) type {
             self.timeout = newElectionTimeout(getTime());
         }
 
-        fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse) void {
+        fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse, id: u32) void {
             self.handleNewerTerm(msg.term);
-
-            // TODO: probably should verify who is the response from to ignore duplicates
             if (self.state != .candidate) return;
-            if (msg.vote_granted) self.votes += 1;
 
-            std.log.info("Received RequestVoteResponse, vote_granted: {any}, total votes: {d}\n", .{ msg.vote_granted, self.votes });
+            self.received_votes[id] = msg.vote_granted;
 
-            if (self.votes >= self.server_no / 2 + 1) self.convertToLeader();
+            var total_votes: u32 = 0;
+            for (self.received_votes) |vote| {
+                if (vote) total_votes += 1;
+            }
+            std.log.info("Received RequestVoteResponse, vote_granted: {any}, total votes: {d}\n", .{ msg.vote_granted, total_votes });
+
+            if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
 
-        fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
+        fn handleAppendEntries(self: *Self, msg: AppendEntries, _: u32) void {
             self.handleNewerTerm(msg.term);
 
             std.log.info("Received AppendEntries from server {d}\n", .{msg.leader_id});
@@ -249,7 +274,7 @@ pub fn Raft(UserData: type) type {
             self.convertToFollower();
         }
 
-        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse) void {
+        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse, _: u32) void {
             self.handleNewerTerm(msg.term);
 
             std.log.info("Received AppendEntriesResponse\n", .{});
@@ -298,9 +323,9 @@ fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft(
     raft.timeout = getTime() - 1;
     _ = raft.tick();
 
-    for (1..len) |_| {
+    for (1..len) |id| {
         const rvr = RequestVoteResponse{ .term = raft.current_term, .vote_granted = true };
-        raft.handleRPC(.{ .request_vote_response = rvr });
+        raft.handleRPC(@intCast(id), .{ .request_vote_response = rvr });
     }
 
     return raft;
@@ -340,22 +365,20 @@ test "successful election" {
 
     // simulate other servers giving the vote to the candidate
     const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
     // no majority => still a candidate
     try std.testing.expect(raft.state == .candidate);
 
+    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
+    // received response from the same server twice => still a candidate
+    try std.testing.expect(raft.state == .candidate);
+
     const rvr2 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = false };
-    raft.handleRPC(RPC{ .request_vote_response = rvr2 });
+    raft.handleRPC(2, RPC{ .request_vote_response = rvr2 });
     // vote not granted => still a candidate
     try std.testing.expect(raft.state == .candidate);
 
-    // TODO: not implemented but should be eventually tested
-    // const rvr3 = RequestVoteResponse{ .term = initial_term, .vote_granted = true };
-    // raft.handleRPC(RPC{ .request_vote_response = rvr3 });
-    // // stale message => still a candidate
-    // try std.testing.expect(raft.state == .candidate);
-
-    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    raft.handleRPC(4, RPC{ .request_vote_response = rvr1 });
     try std.testing.expect(raft.state == .leader);
 
     raft.timeout = getTime() - 1;
@@ -382,7 +405,7 @@ test "failed election (timeout)" {
     try std.testing.expect(raft.current_term == initial_term + 1);
 
     const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(RPC{ .request_vote_response = rvr1 });
+    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
     try std.testing.expect(raft.state == .candidate);
 
     // candidate did not receive majority of the votes
@@ -411,30 +434,58 @@ test "failed election (other server became the leader)" {
     try std.testing.expect(raft.current_term == initial_term + 1);
 
     const rvr = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(RPC{ .request_vote_response = rvr });
+    raft.handleRPC(2, RPC{ .request_vote_response = rvr });
     try std.testing.expect(raft.state == .candidate);
 
     // received AppendEntries => sombody else become the leader
     const ae = AppendEntries{ .term = initial_term + 1, .leader_id = 3 };
-    raft.handleRPC(RPC{ .append_entries = ae });
+    raft.handleRPC(3, RPC{ .append_entries = ae });
     try std.testing.expect(raft.state == .follower);
     try std.testing.expect(raft.current_term == initial_term + 1);
 }
 
-test "respond to RequestVote" {
+test "follower grants a vote" {
     var rpcs: [5]RPC = undefined;
     var raft = setupTestRaft(rpcs.len, &rpcs, false);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
+    // so our log is not empty
+    raft.appendEntry(5);
+
     // skip timeout, but do not tick yet
     raft.timeout = getTime() - 1;
 
-    const cand1 = 3;
     // TODO: is it possible for the candidate to have the same term as the followers?
-    // candidate increases its term when it becomes the candidate sooo ???
-    const rv1 = RequestVote{ .term = initial_term, .candidate_id = cand1 };
-    raft.handleRPC(.{ .request_vote = rv1 });
+    // candidate increases its term when it becomes the candidate (stale candidate?)
+
+    const cand1 = 3;
+    const rv1 = RequestVote{
+        .term = initial_term,
+        .candidate_id = cand1,
+        .last_log_term = 0,
+        .last_log_index = 0,
+    };
+    raft.handleRPC(cand1, .{ .request_vote = rv1 });
+
+    // shouldn't grant vote, log is out of date
+    switch (rpcs[cand1]) {
+        .request_vote_response => |rvr| {
+            try std.testing.expect(!rvr.vote_granted);
+            try std.testing.expect(rvr.term == initial_term);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    const rv2 = RequestVote{
+        .term = initial_term,
+        .candidate_id = cand1,
+        .last_log_term = initial_term,
+        .last_log_index = 50,
+    };
+    raft.handleRPC(cand1, .{ .request_vote = rv2 });
 
     switch (rpcs[cand1]) {
         .request_vote_response => |rvr| {
@@ -453,8 +504,14 @@ test "respond to RequestVote" {
     try std.testing.expect(raft.voted_for == cand1);
 
     const cand2 = 1;
-    const rv2 = RequestVote{ .term = initial_term, .candidate_id = cand2 };
-    raft.handleRPC(.{ .request_vote = rv2 });
+    const rv3 = RequestVote{
+        .term = initial_term,
+        .candidate_id = cand2,
+        // TODO: dummy values
+        .last_log_term = initial_term,
+        .last_log_index = 50,
+    };
+    raft.handleRPC(cand2, .{ .request_vote = rv3 });
 
     // already voted => this vote shouldn't be granted
     switch (rpcs[cand2]) {
@@ -521,11 +578,32 @@ test "follower respects heartbeats" {
     raft.timeout = getTime() - 1;
 
     const ae = AppendEntries{ .leader_id = 1, .term = raft.current_term };
-    raft.handleRPC(.{ .append_entries = ae });
+    raft.handleRPC(1, .{ .append_entries = ae });
 
     try std.testing.expect(raft.state == .follower);
     _ = raft.tick();
 
     // append entries from leader => we should still be a follower after the tick
     try std.testing.expect(raft.state == .follower);
+}
+
+test "converts to follower after receiving RPC with greater term" {
+    var rpcs: [5]RPC = undefined;
+    var raft = setupTestRaft(rpcs.len, &rpcs, true);
+    defer raft.deinit();
+    const initial_term = raft.current_term;
+
+    try std.testing.expect(raft.state == .leader);
+
+    const rv = RequestVote{
+        .term = initial_term + 1,
+        .candidate_id = 1,
+        // TODO: dummy values
+        .last_log_term = initial_term + 1,
+        .last_log_index = 50,
+    };
+    raft.handleRPC(1, .{ .request_vote = rv });
+
+    try std.testing.expect(raft.state == .follower);
+    try std.testing.expect(raft.current_term == initial_term + 1);
 }
