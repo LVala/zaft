@@ -155,7 +155,7 @@ pub fn Raft(UserData: type) type {
             }
             self.received_votes[self.id] = true;
 
-            std.log.info("Starting new election, term: {d}\n", .{self.current_term});
+            std.log.info("Converted to candidate, starting new election, term: {d}\n", .{self.current_term});
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
@@ -182,8 +182,7 @@ pub fn Raft(UserData: type) type {
 
             self.state = .leader;
             for (self.next_index, self.match_index) |*ni, *mi| {
-                // TODO proper initialization
-                ni.* = 420;
+                ni.* = @as(u32, @intCast(self.log.items.len)) + 1;
                 mi.* = 0;
             }
 
