@@ -10,7 +10,7 @@ const setupTestRaft = utils.setupTestRaft;
 fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, follower_log: []const TestRaft.LogEntry, first_common: u32) !void {
     // first_common is a log index (so starts at 1), not array index!
     var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
 
     const leader_id = 1;
@@ -49,6 +49,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
         try testing.expect(l_entry.entry == f_entry.entry);
     }
 
+    try testing.expect(raft.state == .follower);
     try testing.expect(raft.current_term == leader_term);
 }
 
@@ -161,4 +162,36 @@ test "follower replaces conflicting entires based on AppendEntries" {
         .{ .term = 3, .entry = 99 },
     };
     try test_converge_logs(&leader_log, 8, &follower_log4, 3);
+}
+
+test "leader sends AppendEntries on initial entry" {
+    var rpcs: TestRPCs = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+    const initial_term = raft.current_term;
+
+    const entries = [_]u32{ 1, 2, 3 };
+    for (entries) |entry| try raft.appendEntry(entry);
+
+    // initial AppendEntries heartbeat
+    for (rpcs[1..]) |rpc| {
+        switch (rpc) {
+            .append_entries => |ae| {
+                try testing.expect(ae.term == initial_term);
+                try testing.expect(ae.leader_id == 0);
+                try testing.expect(ae.prev_log_index == 0);
+                try testing.expect(ae.prev_log_term == 0);
+                try testing.expect(ae.leader_commit == 0);
+
+                try testing.expect(ae.entries.len == 3);
+                for (ae.entries, entries) |entry, entry_val| {
+                    try testing.expect(entry.term == initial_term);
+                    try testing.expect(entry.entry == entry_val);
+                }
+            },
+            else => {
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
 }

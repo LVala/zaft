@@ -129,7 +129,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
-                self.sendAppendentries(@intCast(idx));
+                self.sendAppendEntries(@intCast(idx));
             }
 
             self.timeout = newHeartbeatTimeout(getTime());
