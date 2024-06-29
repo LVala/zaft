@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub fn Raft(UserData: type, Entry: type) type {
     return struct {
@@ -72,6 +73,8 @@ pub fn Raft(UserData: type, Entry: type) type {
         received_votes: []bool,
 
         pub fn init(id: u32, server_no: u32, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
+            assert(id < server_no);
+
             std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
 
             const time = getTime();
@@ -122,24 +125,11 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             try self.log.append(.{ .term = self.current_term, .entry = entry });
 
+            std.log.info("Entry {any} appended, sending AppendEntries\n", .{entry});
+
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
-
-                const append_entries = AppendEntries{
-                    .term = self.current_term,
-                    .leader_id = self.id,
-                    // TODO: add new fields
-                    .prev_log_index = 0,
-                    .prev_log_term = 0,
-                    .entries = &.{},
-                    .leader_commit = self.commit_index,
-                };
-
-                const rpc = .{ .append_entries = append_entries };
-
-                self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
-                    std.log.warn("Sending AppendEntires to server {d} failed: {any}\n", .{ idx, err });
-                };
+                self.sendAppendentries(@intCast(idx));
             }
 
             self.timeout = newHeartbeatTimeout(getTime());
@@ -150,22 +140,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
-
-                // TODO: add new fields
-                const append_entries = AppendEntries{
-                    .term = self.current_term,
-                    .leader_id = self.id,
-                    // TODO: add new fields
-                    .prev_log_index = 0,
-                    .prev_log_term = 0,
-                    .entries = &.{},
-                    .leader_commit = self.commit_index,
-                };
-                const rpc = .{ .append_entries = append_entries };
-
-                self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
-                    std.log.warn("Sending heartbeat to server {d} failed: {any}\n", .{ idx, err });
-                };
+                self.sendAppendEntries(@intCast(idx));
             }
 
             self.timeout = newHeartbeatTimeout(time);
@@ -184,25 +159,15 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
-
-                const request_vote = RequestVote{
-                    .term = self.current_term,
-                    .candidate_id = self.id,
-                    .last_log_index = @intCast(self.log.items.len),
-                    // TODO: should we send 0 when theres not entries in the log?
-                    .last_log_term = if (self.log.getLastOrNull()) |last| last.term else 0,
-                };
-                const rpc = .{ .request_vote = request_vote };
-
-                self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
-                    std.log.warn("Sending RequestVote to server {d} failed: {any}\n", .{ idx, err });
-                };
+                self.sendRequestVote(@intCast(idx));
             }
 
             self.timeout = newElectionTimeout(time);
         }
 
         fn convertToLeader(self: *Self) void {
+            assert(self.state != .leader);
+
             std.log.info("Converted to leader\n", .{});
 
             self.state = .leader;
@@ -220,6 +185,47 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.state = .follower;
             self.voted_for = null;
             self.timeout = newElectionTimeout(getTime());
+        }
+
+        fn sendRequestVote(self: *Self, to: u32) void {
+            assert(to != self.id);
+            assert(to < self.server_no);
+            assert(self.state == .candidate);
+
+            const request_vote = RequestVote{
+                .term = self.current_term,
+                .candidate_id = self.id,
+                .last_log_index = @intCast(self.log.items.len),
+                .last_log_term = if (self.log.getLastOrNull()) |last| last.term else 0,
+            };
+            const rpc = .{ .request_vote = request_vote };
+
+            self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
+                std.log.warn("Sending RequestVote to server {d} failed: {any}\n", .{ to, err });
+            };
+        }
+
+        fn sendAppendEntries(self: *Self, to: u32) void {
+            assert(to != self.id);
+            assert(to < self.server_no);
+            assert(self.state == .leader);
+
+            const prev_log_idx = self.next_index[to] - 1;
+            const prev_log_term = if (prev_log_idx > 0) self.log.items[prev_log_idx - 1].term else 0;
+
+            const append_entries = AppendEntries{
+                .term = self.current_term,
+                .leader_id = self.id,
+                .prev_log_index = prev_log_idx,
+                .prev_log_term = prev_log_term,
+                .entries = self.log.items[prev_log_idx..],
+                .leader_commit = self.commit_index,
+            };
+            const rpc = .{ .append_entries = append_entries };
+
+            self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
+                std.log.warn("Sending AppendEntries to server {d} failed: {any}\n", .{ to, err });
+            };
         }
 
         pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
@@ -256,21 +262,15 @@ pub fn Raft(UserData: type, Entry: type) type {
                     break :blk false;
                 }
 
+                assert(self.state == .follower);
+
                 self.voted_for = msg.candidate_id;
                 break :blk true;
             };
 
-            const response = RequestVoteResponse{
-                .term = self.current_term,
-                .vote_granted = vote_granted,
-            };
-
             std.log.info("Received RequestVote from server {d} with term {d}, vote_granted: {any}\n", .{ msg.candidate_id, msg.term, vote_granted });
 
-            const rpc = .{ .request_vote_response = response };
-            self.callbacks.makeRPC(self.callbacks.user_data, msg.candidate_id, rpc) catch |err| {
-                std.log.warn("Sending RequestVoteResponse to server {d}, failed: {any}\n", .{ msg.candidate_id, err });
-            };
+            self.sendRequestVoteResponse(msg.candidate_id, vote_granted);
 
             self.timeout = newElectionTimeout(getTime());
         }
@@ -303,7 +303,6 @@ pub fn Raft(UserData: type, Entry: type) type {
                 if (self.state == .candidate) self.convertToFollower();
 
                 // TODO: set current leader to msg.leader_id
-                // TODO: we can assert that prev_log_index is not < commit index
 
                 // if prev_log_index == 0, this is the very first entry
                 if (msg.prev_log_index != 0) {
@@ -316,9 +315,9 @@ pub fn Raft(UserData: type, Entry: type) type {
                     const entry = self.log.items[msg.prev_log_index - 1];
 
                     if (entry.term != msg.prev_log_term) {
-                        // TODO: term > our term? convert to follower
-                        // also, msg.term should be greater in this case
-                        // TODO: remove following entries
+                        // make sure commited entries do not conflict
+                        // otherwise, something went very wrong
+                        assert(msg.prev_log_term > self.commit_index);
                         break :blk false;
                     }
                 }
@@ -340,17 +339,9 @@ pub fn Raft(UserData: type, Entry: type) type {
                 break :blk true;
             };
 
-            const response = AppendEntriesResponse{
-                .term = self.current_term,
-                .success = success,
-            };
-
             std.log.info("Received AppendEntries from server {d} with term {d}, success: {any}\n", .{ msg.leader_id, msg.term, success });
 
-            const rpc = .{ .append_entries_response = response };
-            self.callbacks.makeRPC(self.callbacks.user_data, msg.leader_id, rpc) catch |err| {
-                std.log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}\n", .{ msg.leader_id, err });
-            };
+            self.sendAppendEntriesResponse(msg.leader_id, success);
 
             self.timeout = newElectionTimeout(getTime());
         }
@@ -370,6 +361,30 @@ pub fn Raft(UserData: type, Entry: type) type {
                 self.current_term = msg_term;
                 self.convertToFollower();
             }
+        }
+
+        fn sendRequestVoteResponse(self: *Self, to: u32, vote_granted: bool) void {
+            const response = RequestVoteResponse{
+                .term = self.current_term,
+                .vote_granted = vote_granted,
+            };
+
+            const rpc = .{ .request_vote_response = response };
+            self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
+                std.log.warn("Sending RequestVoteResponse to server {d}, failed: {any}\n", .{ to, err });
+            };
+        }
+
+        fn sendAppendEntriesResponse(self: *Self, to: u32, success: bool) void {
+            const response = AppendEntriesResponse{
+                .term = self.current_term,
+                .success = success,
+            };
+
+            const rpc = .{ .append_entries_response = response };
+            self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
+                std.log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}\n", .{ to, err });
+            };
         }
 
         fn newElectionTimeout(time: u64) u64 {
