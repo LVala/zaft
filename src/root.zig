@@ -1,56 +1,54 @@
 const std = @import("std");
 
-pub const AppendEntries = struct {
-    term: u32,
-    leader_id: u32,
-    // prev_log_index: u32,
-    // prev_log_term: u32,
-    // entries: []u32,
-    // leader_commit: u32,
-};
-
-pub const AppendEntriesResponse = struct {
-    term: u32,
-    success: bool,
-};
-
-pub const RequestVote = struct {
-    term: u32,
-    candidate_id: u32,
-    last_log_index: u32,
-    last_log_term: u32,
-};
-
-pub const RequestVoteResponse = struct {
-    term: u32,
-    vote_granted: bool,
-};
-
-pub const RPC = union(enum) {
-    append_entries: AppendEntries,
-    append_entries_response: AppendEntriesResponse,
-    request_vote: RequestVote,
-    request_vote_response: RequestVoteResponse,
-};
-
-pub fn Callbacks(UserData: type) type {
-    return struct {
-        user_data: *UserData,
-        makeRPC: *const fn (user_data: *UserData, id: u32, rpc: RPC) anyerror!void,
-    };
-}
-
-pub fn Raft(UserData: type) type {
+pub fn Raft(UserData: type, Entry: type) type {
     return struct {
         const State = enum { follower, candidate, leader };
-        // TODO: u32 is temporary
-        const LogEntry = struct { term: u32, entry: u32 };
         const Self = @This();
 
         const default_timeout = 1000;
         const heartbeat_timeout = 500;
 
-        callbacks: Callbacks(UserData),
+        pub const LogEntry = struct { term: u32, entry: Entry };
+
+        pub const Callbacks = struct {
+            user_data: *UserData,
+            makeRPC: *const fn (user_data: *UserData, id: u32, rpc: RPC) anyerror!void,
+        };
+
+        pub const AppendEntries = struct {
+            term: u32,
+            leader_id: u32,
+            prev_log_index: u32,
+            prev_log_term: u32,
+            entries: []const LogEntry,
+            leader_commit: u32,
+        };
+
+        pub const AppendEntriesResponse = struct {
+            term: u32,
+            success: bool,
+        };
+
+        pub const RequestVote = struct {
+            term: u32,
+            candidate_id: u32,
+            last_log_index: u32,
+            last_log_term: u32,
+        };
+
+        pub const RequestVoteResponse = struct {
+            term: u32,
+            vote_granted: bool,
+        };
+
+        pub const RPC = union(enum) {
+            append_entries: AppendEntries,
+            append_entries_response: AppendEntriesResponse,
+            request_vote: RequestVote,
+            request_vote_response: RequestVoteResponse,
+        };
+
+        callbacks: Callbacks,
         allocator: std.mem.Allocator,
         id: u32,
         server_no: u32,
@@ -73,7 +71,7 @@ pub fn Raft(UserData: type) type {
         // candidate-specific
         received_votes: []bool,
 
-        pub fn init(id: u32, server_no: u32, callbacks: Callbacks(UserData), allocator: std.mem.Allocator) !Self {
+        pub fn init(id: u32, server_no: u32, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
             std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
 
             const time = getTime();
@@ -111,19 +109,40 @@ pub fn Raft(UserData: type) type {
                 else => self.convertToCandidate(time),
             }
 
+            // TODO: apply commited entries here?
+
             // return min(remaining time, hearteat_timeout), even when
             // we aren't the leader (we might get elected quickly, and thus cannot
             // wait for the whole election_timeout to start sending hearbeats)
             return @min(self.timeout - time, heartbeat_timeout);
         }
 
-        pub fn appendEntry(self: *Self, entry: u32) void {
-            // TODO
-            // 1. If not a leader => redirect
-            // 2. add the entry to the log
-            // 3. Send appendEntries to others
+        pub fn appendEntry(self: *Self, entry: Entry) !void {
+            if (self.state != .leader) return error.NotALeader;
 
-            self.log.append(.{ .term = self.current_term, .entry = entry }) catch unreachable;
+            try self.log.append(.{ .term = self.current_term, .entry = entry });
+
+            for (0..self.server_no) |idx| {
+                if (idx == self.id) continue;
+
+                const append_entries = AppendEntries{
+                    .term = self.current_term,
+                    .leader_id = self.id,
+                    // TODO: add new fields
+                    .prev_log_index = 0,
+                    .prev_log_term = 0,
+                    .entries = &.{},
+                    .leader_commit = self.commit_index,
+                };
+
+                const rpc = .{ .append_entries = append_entries };
+
+                self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
+                    std.log.warn("Sending AppendEntires to server {d} failed: {any}\n", .{ idx, err });
+                };
+            }
+
+            self.timeout = newHeartbeatTimeout(getTime());
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
@@ -132,11 +151,17 @@ pub fn Raft(UserData: type) type {
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
 
-                const request_vote = AppendEntries{
+                // TODO: add new fields
+                const append_entries = AppendEntries{
                     .term = self.current_term,
                     .leader_id = self.id,
+                    // TODO: add new fields
+                    .prev_log_index = 0,
+                    .prev_log_term = 0,
+                    .entries = &.{},
+                    .leader_commit = self.commit_index,
                 };
-                const rpc = .{ .append_entries = request_vote };
+                const rpc = .{ .append_entries = append_entries };
 
                 self.callbacks.makeRPC(self.callbacks.user_data, @intCast(idx), rpc) catch |err| {
                     std.log.warn("Sending heartbeat to server {d} failed: {any}\n", .{ idx, err });
@@ -201,7 +226,7 @@ pub fn Raft(UserData: type) type {
             switch (rpc) {
                 .request_vote => |msg| self.handleRequestVote(msg),
                 .request_vote_response => |msg| self.handleRequestVoteResponse(msg, id),
-                .append_entries => |msg| self.handleAppendEntries(msg, id),
+                .append_entries => |msg| self.handleAppendEntries(msg),
                 .append_entries_response => |msg| self.handleAppendEntriesResponse(msg, id),
             }
         }
@@ -252,6 +277,8 @@ pub fn Raft(UserData: type) type {
 
         fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse, id: u32) void {
             self.handleNewerTerm(msg.term);
+
+            if (msg.term < self.current_term) return;
             if (self.state != .candidate) return;
 
             self.received_votes[id] = msg.vote_granted;
@@ -265,16 +292,74 @@ pub fn Raft(UserData: type) type {
             if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
 
-        fn handleAppendEntries(self: *Self, msg: AppendEntries, _: u32) void {
+        fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
             self.handleNewerTerm(msg.term);
 
-            std.log.info("Received AppendEntries from server {d}\n", .{msg.leader_id});
-            // TODO
-            self.convertToFollower();
+            const success = blk: {
+                if (msg.term < self.current_term) {
+                    break :blk false;
+                }
+
+                if (self.state == .candidate) self.convertToFollower();
+
+                // TODO: set current leader to msg.leader_id
+                // TODO: we can assert that prev_log_index is not < commit index
+
+                // if prev_log_index == 0, this is the very first entry
+                if (msg.prev_log_index != 0) {
+                    // make sure the index and term of previous entry match
+                    if (self.log.items.len < msg.prev_log_index) {
+                        break :blk false;
+                    }
+
+                    // log indices start at 1!
+                    const entry = self.log.items[msg.prev_log_index - 1];
+
+                    if (entry.term != msg.prev_log_term) {
+                        // TODO: term > our term? convert to follower
+                        // also, msg.term should be greater in this case
+                        // TODO: remove following entries
+                        break :blk false;
+                    }
+                }
+
+                // in case there are entries not matching after the prev_log_index
+                // TODO: should we remove the entries right when we check the terms?
+                // TODO: should be iterate over entries in the msg and append only after we find the non-matching one
+                // I believe that all of the following entries should be non-matching in such case
+                self.log.shrinkRetainingCapacity(msg.prev_log_index);
+                self.log.appendSlice(msg.entries) catch |err| {
+                    std.log.warn("Appending new entry to the log failed: {any}\n", .{err});
+                    break :blk false;
+                };
+
+                if (msg.leader_commit > self.commit_index) {
+                    self.commit_index = @min(msg.leader_commit, self.log.items.len);
+                }
+
+                break :blk true;
+            };
+
+            const response = AppendEntriesResponse{
+                .term = self.current_term,
+                .success = success,
+            };
+
+            std.log.info("Received AppendEntries from server {d} with term {d}, success: {any}\n", .{ msg.leader_id, msg.term, success });
+
+            const rpc = .{ .append_entries_response = response };
+            self.callbacks.makeRPC(self.callbacks.user_data, msg.leader_id, rpc) catch |err| {
+                std.log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}\n", .{ msg.leader_id, err });
+            };
+
+            self.timeout = newElectionTimeout(getTime());
         }
 
         fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse, _: u32) void {
             self.handleNewerTerm(msg.term);
+
+            if (msg.term < self.current_term) return;
+            if (self.state != .leader) return;
 
             std.log.info("Received AppendEntriesResponse\n", .{});
             // TODO
@@ -307,15 +392,23 @@ fn getTime() u64 {
 
 // TESTS
 
-fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft([len]RPC) {
-    const callbacks = Callbacks([len]RPC){ .user_data = rpcs, .makeRPC = struct {
-        pub fn makeRPC(ud: *[len]RPC, id: u32, rpc: RPC) !void {
-            ud.*[id] = rpc;
-        }
-    }.makeRPC };
+const len = 5;
+const TestRaft = Raft(anyopaque, u32);
+
+fn setupTestRaft(rpcs: *[len]TestRaft.RPC, elect_leader: bool) TestRaft {
+    const callbacks = TestRaft.Callbacks{
+        .user_data = rpcs,
+        .makeRPC = struct {
+            pub fn makeRPC(ud: *anyopaque, id: u32, rpc: TestRaft.RPC) !void {
+                // TODO: I don't know what I did here
+                const ud_rpcs = @as(*[len]TestRaft.RPC, @alignCast(@ptrCast(ud)));
+                ud_rpcs.*[id] = rpc;
+            }
+        }.makeRPC,
+    };
 
     // our Raft always gets the id 0
-    var raft = Raft([len]RPC).init(0, len, callbacks, std.testing.allocator) catch unreachable;
+    var raft = TestRaft.init(0, len, callbacks, std.testing.allocator) catch unreachable;
 
     if (!elect_leader) return raft;
 
@@ -323,7 +416,7 @@ fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft(
     _ = raft.tick();
 
     for (1..len) |id| {
-        const rvr = RequestVoteResponse{ .term = raft.current_term, .vote_granted = true };
+        const rvr = TestRaft.RequestVoteResponse{ .term = raft.current_term, .vote_granted = true };
         raft.handleRPC(@intCast(id), .{ .request_vote_response = rvr });
     }
 
@@ -331,11 +424,11 @@ fn setupTestRaft(comptime len: usize, rpcs: *[len]RPC, elect_leader: bool) Raft(
 }
 
 test "successful election" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
-    const initial_term = raft.current_term;
 
+    const initial_term = raft.current_term;
     // nothing should happen after initial tick, it's to early for election timeout
     _ = raft.tick();
 
@@ -363,21 +456,21 @@ test "successful election" {
     }
 
     // simulate other servers giving the vote to the candidate
-    const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
+    const rvr1 = TestRaft.RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(1, TestRaft.RPC{ .request_vote_response = rvr1 });
     // no majority => still a candidate
     try std.testing.expect(raft.state == .candidate);
 
-    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
+    raft.handleRPC(1, TestRaft.RPC{ .request_vote_response = rvr1 });
     // received response from the same server twice => still a candidate
     try std.testing.expect(raft.state == .candidate);
 
-    const rvr2 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = false };
-    raft.handleRPC(2, RPC{ .request_vote_response = rvr2 });
+    const rvr2 = TestRaft.RequestVoteResponse{ .term = initial_term + 1, .vote_granted = false };
+    raft.handleRPC(2, TestRaft.RPC{ .request_vote_response = rvr2 });
     // vote not granted => still a candidate
     try std.testing.expect(raft.state == .candidate);
 
-    raft.handleRPC(4, RPC{ .request_vote_response = rvr1 });
+    raft.handleRPC(4, TestRaft.RPC{ .request_vote_response = rvr1 });
     try std.testing.expect(raft.state == .leader);
 
     raft.timeout = getTime() - 1;
@@ -388,8 +481,8 @@ test "successful election" {
 }
 
 test "failed election (timeout)" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
@@ -403,8 +496,8 @@ test "failed election (timeout)" {
     try std.testing.expect(raft.state == .candidate);
     try std.testing.expect(raft.current_term == initial_term + 1);
 
-    const rvr1 = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(1, RPC{ .request_vote_response = rvr1 });
+    const rvr1 = TestRaft.RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(1, TestRaft.RPC{ .request_vote_response = rvr1 });
     try std.testing.expect(raft.state == .candidate);
 
     // candidate did not receive majority of the votes
@@ -417,8 +510,8 @@ test "failed election (timeout)" {
 }
 
 test "failed election (other server became the leader)" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
@@ -432,25 +525,33 @@ test "failed election (other server became the leader)" {
     try std.testing.expect(raft.state == .candidate);
     try std.testing.expect(raft.current_term == initial_term + 1);
 
-    const rvr = RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
-    raft.handleRPC(2, RPC{ .request_vote_response = rvr });
+    const rvr = TestRaft.RequestVoteResponse{ .term = initial_term + 1, .vote_granted = true };
+    raft.handleRPC(2, TestRaft.RPC{ .request_vote_response = rvr });
     try std.testing.expect(raft.state == .candidate);
 
     // received AppendEntries => sombody else become the leader
-    const ae = AppendEntries{ .term = initial_term + 1, .leader_id = 3 };
-    raft.handleRPC(3, RPC{ .append_entries = ae });
+    const ae = TestRaft.AppendEntries{
+        .term = initial_term + 1,
+        .leader_id = 3,
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    };
+    raft.handleRPC(3, TestRaft.RPC{ .append_entries = ae });
     try std.testing.expect(raft.state == .follower);
     try std.testing.expect(raft.current_term == initial_term + 1);
 }
 
 test "follower grants a vote" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
-    // so our log is not empty
-    raft.appendEntry(5);
+    // so our log is not empty and candidate log is up-to-date
+    // normally, one should use Raft.appendEntry
+    try raft.log.append(.{ .term = initial_term, .entry = 5 });
 
     // skip timeout, but do not tick yet
     raft.timeout = getTime() - 1;
@@ -459,7 +560,7 @@ test "follower grants a vote" {
     // candidate increases its term when it becomes the candidate (stale candidate?)
 
     const cand1 = 3;
-    const rv1 = RequestVote{
+    const rv1 = TestRaft.RequestVote{
         .term = initial_term,
         .candidate_id = cand1,
         .last_log_term = 0,
@@ -478,7 +579,7 @@ test "follower grants a vote" {
         },
     }
 
-    const rv2 = RequestVote{
+    const rv2 = TestRaft.RequestVote{
         .term = initial_term,
         .candidate_id = cand1,
         .last_log_term = initial_term,
@@ -503,7 +604,7 @@ test "follower grants a vote" {
     try std.testing.expect(raft.voted_for == cand1);
 
     const cand2 = 1;
-    const rv3 = RequestVote{
+    const rv3 = TestRaft.RequestVote{
         .term = initial_term,
         .candidate_id = cand2,
         // TODO: dummy values
@@ -528,8 +629,8 @@ test "follower grants a vote" {
 }
 
 test "leader sends heartbeats" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, true);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, true);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
@@ -569,14 +670,21 @@ test "leader sends heartbeats" {
 }
 
 test "follower respects heartbeats" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, false);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
 
     // skip timeout
     raft.timeout = getTime() - 1;
 
-    const ae = AppendEntries{ .leader_id = 1, .term = raft.current_term };
+    const ae = TestRaft.AppendEntries{
+        .leader_id = 1,
+        .term = raft.current_term,
+        .prev_log_index = 0,
+        .prev_log_term = 0,
+        .entries = &.{},
+        .leader_commit = 0,
+    };
     raft.handleRPC(1, .{ .append_entries = ae });
 
     try std.testing.expect(raft.state == .follower);
@@ -586,15 +694,171 @@ test "follower respects heartbeats" {
     try std.testing.expect(raft.state == .follower);
 }
 
+fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, follower_log: []const TestRaft.LogEntry, first_common: u32) !void {
+    // first_common is a log index (so starts at 1), not array index!
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+
+    const leader_id = 1;
+
+    for (follower_log) |entry| try raft.log.append(entry);
+    raft.current_term = follower_log[follower_log.len - 1].term;
+
+    // we start with empty AppendEntries
+    var idx: usize = leader_log.len + 1;
+    while (idx > first_common) : (idx -= 1) {
+        const ae = TestRaft.AppendEntries{
+            .leader_id = leader_id,
+            .term = leader_term,
+            .prev_log_index = @intCast(idx - 1),
+            .prev_log_term = leader_log[idx - 2].term,
+            .entries = leader_log[(idx - 1)..],
+            .leader_commit = 0,
+        };
+        raft.handleRPC(leader_id, .{ .append_entries = ae });
+
+        switch (rpcs[leader_id]) {
+            .append_entries_response => |aer| {
+                const valid = if (idx == first_common + 1) aer.success else !aer.success;
+                try std.testing.expect(valid);
+            },
+            else => {
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // check if the follower log is equal to leaders log
+    try std.testing.expect(leader_log.len == raft.log.items.len);
+    for (leader_log, raft.log.items) |l_entry, f_entry| {
+        try std.testing.expect(l_entry.term == f_entry.term);
+        try std.testing.expect(l_entry.entry == f_entry.entry);
+    }
+
+    try std.testing.expect(raft.current_term == leader_term);
+}
+
+test "follower adds new entries from AppendEntries" {
+    // from Figure 7 in the Raft paper
+    const leader_log = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+        .{ .term = 6, .entry = 10 },
+    };
+
+    const follower_log1 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log1, 9);
+
+    const follower_log2 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log2, 4);
+}
+
+test "follower replaces conflicting entires based on AppendEntries" {
+    // from Figure 7 in the Raft paper
+    const leader_log = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+        .{ .term = 6, .entry = 10 },
+    };
+
+    // entries with value 99 should be removed
+    const follower_log1 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+        .{ .term = 6, .entry = 10 },
+        .{ .term = 6, .entry = 99 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log1, 10);
+
+    const follower_log2 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+        .{ .term = 6, .entry = 10 },
+        .{ .term = 7, .entry = 99 },
+        .{ .term = 7, .entry = 99 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log2, 10);
+
+    const follower_log3 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 4, .entry = 99 },
+        .{ .term = 4, .entry = 99 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log3, 5);
+
+    const follower_log4 = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 2, .entry = 99 },
+        .{ .term = 2, .entry = 99 },
+        .{ .term = 2, .entry = 99 },
+        .{ .term = 3, .entry = 99 },
+        .{ .term = 3, .entry = 99 },
+        .{ .term = 3, .entry = 99 },
+        .{ .term = 3, .entry = 99 },
+        .{ .term = 3, .entry = 99 },
+    };
+    try test_converge_logs(&leader_log, 8, &follower_log4, 3);
+}
+
 test "converts to follower after receiving RPC with greater term" {
-    var rpcs: [5]RPC = undefined;
-    var raft = setupTestRaft(rpcs.len, &rpcs, true);
+    var rpcs: [len]TestRaft.RPC = undefined;
+    var raft = setupTestRaft(&rpcs, true);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
     try std.testing.expect(raft.state == .leader);
 
-    const rv = RequestVote{
+    const rv = TestRaft.RequestVote{
         .term = initial_term + 1,
         .candidate_id = 1,
         // TODO: dummy values
