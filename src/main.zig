@@ -28,6 +28,13 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub const AppendEntriesResponse = struct {
             term: u32,
             success: bool,
+            // non-Raft field
+            // it is what the follower expects to receive in next prev_log_idx
+            // if !success, it is the last conflicting idx (so prev_log_idx) - 1
+            // if success, it is the last log idx
+            // allows to detect stale messages, decouples the response from AE itself
+            // and makes the AE response idempotent
+            next_index: u32,
         };
 
         pub const RequestVote = struct {
@@ -229,6 +236,9 @@ pub fn Raft(UserData: type, Entry: type) type {
         }
 
         pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
+            assert(id != self.id);
+            assert(id < self.server_no);
+
             switch (rpc) {
                 .request_vote => |msg| self.handleRequestVote(msg),
                 .request_vote_response => |msg| self.handleRequestVoteResponse(msg, id),
@@ -287,7 +297,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             for (self.received_votes) |vote| {
                 if (vote) total_votes += 1;
             }
-            std.log.info("Received RequestVoteResponse, vote_granted: {any}, total votes: {d}\n", .{ msg.vote_granted, total_votes });
+            std.log.info("Received RequestVoteResponse from {d}, vote_granted: {any}, total votes: {d}\n", .{ id, msg.vote_granted, total_votes });
 
             if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
@@ -318,19 +328,48 @@ pub fn Raft(UserData: type, Entry: type) type {
                         // make sure commited entries do not conflict
                         // otherwise, something went very wrong
                         assert(msg.prev_log_term > self.commit_index);
+
+                        // remove conflicting entries
+                        self.log.shrinkRetainingCapacity(msg.prev_log_index - 1);
                         break :blk false;
                     }
                 }
 
-                // in case there are entries not matching after the prev_log_index
-                // TODO: should we remove the entries right when we check the terms?
-                // TODO: should be iterate over entries in the msg and append only after we find the non-matching one
-                // I believe that all of the following entries should be non-matching in such case
-                self.log.shrinkRetainingCapacity(msg.prev_log_index);
-                self.log.appendSlice(msg.entries) catch |err| {
-                    std.log.warn("Appending new entry to the log failed: {any}\n", .{err});
-                    break :blk false;
-                };
+                // this can be a stale AppendEntries, so we cannot just append mindlessly
+                // otherwise, if we just removed entries after prev_log_index
+                // we could remove entries added by AE out of order
+                for (msg.entries, (msg.prev_log_index + 1)..) |entry, idx| {
+                    if (idx <= self.log.items.len) {
+                        // previous unsuccessful AEs should have removed conflicting elements
+                        // in theory, AE could skip some conflicting indicies and jump to matching prev_log_index
+                        // right away, but I'm not sure how and the assert won't hurt
+                        // instead of the assert, we could just remove all of the following entries
+                        assert(self.log.items[idx - 1].term == entry.term);
+                    } else {
+                        self.log.append(entry) catch |err| {
+                            std.log.warn("Appending new entry to the log failed: {any}\n", .{err});
+                            break :blk false;
+                        };
+                    }
+                }
+
+                // because we allow messages in invalid order, sometimes scenario like this will happen
+                // numbers are terms, current term = 8 (example from Figure 7 in the Raft paper)
+                // leader log: 1 1 1 4 4 5 5 6 6 6
+                // follow log: 1 1 1 4 4 5 5 6 6 6 6 7 ...
+                // in the first empty AE message prev_log_x values will match, but the last > 2 entries are invalid
+                // because the for loop above doesn't remove entries, we will keep them
+                // to avoid that, let's check the entry after the newly added entries (assuming it exists)
+                // if its term is < msg.term, these are stale entries, and we can remove them
+                const after_entries = msg.prev_log_index + msg.entries.len;
+                if (after_entries < self.log.items.len) {
+                    if (self.log.items[after_entries].term < msg.term) {
+                        self.log.shrinkRetainingCapacity(after_entries);
+                    }
+                }
+                // instead of doing that, we could remove entries in the for loop instead of the assert
+                // but for that to work, we would need to wait for AE with index 11
+                // now we remove the invalid entries right with the very first empty AE
 
                 if (msg.leader_commit > self.commit_index) {
                     self.commit_index = @min(msg.leader_commit, self.log.items.len);
@@ -346,14 +385,16 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.timeout = newElectionTimeout(getTime());
         }
 
-        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse, _: u32) void {
+        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse, id: u32) void {
             self.handleNewerTerm(msg.term);
 
             if (msg.term < self.current_term) return;
             if (self.state != .leader) return;
 
-            std.log.info("Received AppendEntriesResponse\n", .{});
-            // TODO
+            // stale message, match_index never decreases
+            if (msg.next_index < self.match_index[id]) return;
+
+            std.log.info("Received AppendEntriesResponse from {d}\n", .{id});
         }
 
         fn handleNewerTerm(self: *Self, msg_term: u32) void {
@@ -379,6 +420,8 @@ pub fn Raft(UserData: type, Entry: type) type {
             const response = AppendEntriesResponse{
                 .term = self.current_term,
                 .success = success,
+                // TODO: temporary
+                .next_index = 0,
             };
 
             const rpc = .{ .append_entries_response = response };

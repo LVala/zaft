@@ -164,6 +164,86 @@ test "follower replaces conflicting entires based on AppendEntries" {
     try test_converge_logs(&leader_log, 8, &follower_log4, 3);
 }
 
+test "stale AppendEntries does not shorten followers log" {
+    var rpcs: TestRPCs = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+
+    const leader_id = 1;
+    const leader_term = 6;
+
+    const log = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 2, .entry = 3 },
+        .{ .term = 2, .entry = 4 },
+        .{ .term = 3, .entry = 5 },
+        .{ .term = 4, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+    };
+
+    for (log[0..6]) |entry| try raft.log.append(entry);
+    raft.current_term = leader_term;
+
+    // new leader has 2 new entries: log[6] and log[7]
+    // leader send the mesages one after another, without waiting for the answer
+    // but the AppendEntries messages came in invalid order
+    // even though, the final state should be vaild
+    const ae = TestRaft.AppendEntries{
+        .leader_id = leader_id,
+        .term = leader_term,
+        .prev_log_index = 6,
+        .prev_log_term = 4,
+        .entries = log[6..],
+        .leader_commit = 0,
+    };
+    raft.handleRPC(leader_id, .{ .append_entries = ae });
+
+    switch (rpcs[leader_id]) {
+        .append_entries_response => |aer| {
+            try testing.expect(aer.success);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // log should be already in the final state
+    try testing.expect(log.len == raft.log.items.len);
+    for (log, raft.log.items) |l_entry, f_entry| {
+        try testing.expect(l_entry.term == f_entry.term);
+        try testing.expect(l_entry.entry == f_entry.entry);
+    }
+
+    // now, the stale AppendEntries comes
+    const ae2 = TestRaft.AppendEntries{
+        .leader_id = leader_id,
+        .term = leader_term,
+        .prev_log_index = 6,
+        .prev_log_term = 4,
+        .entries = log[6..7],
+        .leader_commit = 0,
+    };
+    raft.handleRPC(leader_id, .{ .append_entries = ae2 });
+
+    switch (rpcs[leader_id]) {
+        .append_entries_response => |aer| {
+            try testing.expect(aer.success);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // nothing should change in the log, but the response should be successful
+    try testing.expect(log.len == raft.log.items.len);
+    for (log, raft.log.items) |l_entry, f_entry| {
+        try testing.expect(l_entry.term == f_entry.term);
+        try testing.expect(l_entry.entry == f_entry.entry);
+    }
+}
+
 test "leader sends AppendEntries on initial entry" {
     var rpcs: TestRPCs = undefined;
     var raft = setupTestRaft(&rpcs, true);
