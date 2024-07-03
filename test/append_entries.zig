@@ -27,7 +27,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
             .prev_log_index = @intCast(idx - 1),
             .prev_log_term = leader_log[idx - 2].term,
             .entries = leader_log[(idx - 1)..],
-            .leader_commit = 0,
+            .leader_commit = 2,
         };
         raft.handleRPC(leader_id, .{ .append_entries = ae });
 
@@ -51,6 +51,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
 
     try testing.expect(raft.state == .follower);
     try testing.expect(raft.current_term == leader_term);
+    try testing.expect(raft.commit_index == 2);
 }
 
 test "follower adds new entries from AppendEntries" {
@@ -166,7 +167,7 @@ test "follower replaces conflicting entires based on AppendEntries" {
 
 test "stale AppendEntries does not shorten followers log" {
     var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var raft = setupTestRaft(&rpcs, false);
     defer raft.deinit();
 
     const leader_id = 1;
@@ -274,4 +275,215 @@ test "leader sends AppendEntries on initial entry" {
             },
         }
     }
+}
+
+test "leader handles AppendEntriesResponse" {
+    var rpcs: TestRPCs = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+
+    const follower_id = 1;
+
+    const log = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 2, .entry = 3 },
+        .{ .term = 2, .entry = 4 },
+        .{ .term = 3, .entry = 5 },
+        .{ .term = 4, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 6, .entry = 8 },
+    };
+
+    // pretend as if leader started with log in this state
+    for (log) |entry| try raft.log.append(entry);
+    raft.current_term = 6;
+    for (raft.next_index) |*ni| ni.* = 9;
+    for (raft.match_index) |*mi| mi.* = 0;
+
+    // this the leader's match index
+    raft.match_index[0] = 8;
+
+    // lets assume the last entry conflicts
+    const aer = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = false,
+        .next_prev_index = 7,
+    };
+    raft.handleRPC(follower_id, .{ .append_entries_response = aer });
+
+    switch (rpcs[follower_id]) {
+        .append_entries => |ae| {
+            try testing.expect(ae.prev_log_index == 7);
+            try testing.expect(ae.prev_log_term == 5);
+            try testing.expect(ae.entries.len == 1);
+            try testing.expect(ae.entries[0].term == 6);
+            try testing.expect(ae.entries[0].entry == 8);
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    try testing.expect(raft.next_index[follower_id] == 8);
+    try testing.expect(raft.match_index[follower_id] == 0);
+
+    // it was conflicting once again
+    const aer2 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = false,
+        .next_prev_index = 6,
+    };
+    raft.handleRPC(follower_id, .{ .append_entries_response = aer2 });
+
+    switch (rpcs[follower_id]) {
+        .append_entries => |ae| {
+            try testing.expect(ae.prev_log_index == 6);
+            try testing.expect(ae.prev_log_term == 4);
+            try testing.expect(ae.entries.len == 2);
+            for (log[6..], ae.entries) |log_entry, ae_entry| {
+                try testing.expect(ae_entry.term == log_entry.term);
+                try testing.expect(ae_entry.entry == log_entry.entry);
+            }
+        },
+        else => {
+            return error.TestUnexpectedResult;
+        },
+    }
+
+    // some dummy value so we can later assert that the raft did not sent another AE
+    rpcs[follower_id] = .{ .request_vote_response = TestRaft.RequestVoteResponse{ .term = 0, .vote_granted = false } };
+
+    try testing.expect(raft.next_index[follower_id] == 7);
+    try testing.expect(raft.match_index[follower_id] == 0);
+
+    const aer3 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = true,
+        .next_prev_index = 8,
+    };
+    raft.handleRPC(follower_id, .{ .append_entries_response = aer3 });
+
+    switch (rpcs[follower_id]) {
+        .append_entries => return error.TestUnexpectedResult,
+        else => {},
+    }
+
+    try testing.expect(raft.next_index[follower_id] == 9);
+    try testing.expect(raft.match_index[follower_id] == 8);
+}
+
+test "leader commits entries after replicating on majority of servers" {
+    // we have 5 servers
+    var rpcs: TestRPCs = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+
+    try testing.expect(raft.commit_index == 0);
+
+    try raft.appendEntry(5);
+
+    const aer = TestRaft.AppendEntriesResponse{
+        .success = true,
+        .term = raft.current_term,
+        .next_prev_index = 1,
+    };
+    raft.handleRPC(1, .{ .append_entries_response = aer });
+    try testing.expect(raft.commit_index == 0);
+
+    // duplicate message, should be ignored
+    raft.handleRPC(1, .{ .append_entries_response = aer });
+    try testing.expect(raft.commit_index == 0);
+
+    raft.handleRPC(2, .{ .append_entries_response = aer });
+    try testing.expect(raft.commit_index == 1);
+
+    // the rest of responsed shouldn't change anything
+    for (3..5) |id| raft.handleRPC(@intCast(id), .{ .append_entries_response = aer });
+
+    try testing.expect(raft.commit_index == 1);
+    for (0..5) |id| try testing.expect(raft.match_index[id] == 1);
+    for (0..5) |id| try testing.expect(raft.next_index[id] == 2);
+}
+
+test "leader does not commit entires from previous terms" {
+    // we have 5 servers
+    var rpcs: TestRPCs = undefined;
+    var raft = setupTestRaft(&rpcs, true);
+    defer raft.deinit();
+
+    const log = [_]TestRaft.LogEntry{
+        .{ .term = 1, .entry = 1 },
+        .{ .term = 1, .entry = 2 },
+        .{ .term = 1, .entry = 3 },
+        .{ .term = 4, .entry = 4 },
+        .{ .term = 4, .entry = 5 },
+        .{ .term = 5, .entry = 6 },
+        .{ .term = 5, .entry = 7 },
+        .{ .term = 5, .entry = 8 },
+        .{ .term = 6, .entry = 9 },
+        .{ .term = 6, .entry = 10 },
+    };
+
+    // pretend as if leader started with log in this state
+    for (log) |entry| try raft.log.append(entry);
+    raft.current_term = 6;
+    raft.commit_index = 5;
+    for (raft.next_index) |*ni| ni.* = 6;
+    for (raft.match_index) |*mi| mi.* = 5;
+
+    // leader's match and next index
+    raft.next_index[0] = 11;
+    raft.match_index[0] = 10;
+
+    // the last follower replicated up to 7th entry somehow
+    const aer1 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = true,
+        .next_prev_index = 7,
+    };
+    raft.handleRPC(4, .{ .append_entries_response = aer1 });
+
+    // nothing should change so far
+    try testing.expect(raft.next_index[4] == 8);
+    try testing.expect(raft.match_index[4] == 7);
+    try testing.expect(raft.commit_index == 5);
+
+    const aer2 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = true,
+        .next_prev_index = 9,
+    };
+    raft.handleRPC(1, .{ .append_entries_response = aer2 });
+
+    // now the 6th entry should be replicated by majority of the servers
+    // but (because of old term) it should not be commited just yet
+    try testing.expect(raft.next_index[1] == 10);
+    try testing.expect(raft.match_index[1] == 9);
+    try testing.expect(raft.commit_index == 5);
+
+    const aer3 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = true,
+        .next_prev_index = 10,
+    };
+    raft.handleRPC(2, .{ .append_entries_response = aer3 });
+
+    // now 9th entry is replicated on majority of the servers
+    // and it's term is equal to the current term
+    // so it should be commited together with all of the previous entries
+    try testing.expect(raft.next_index[2] == 11);
+    try testing.expect(raft.match_index[2] == 10);
+    try testing.expect(raft.commit_index == 9);
+
+    const aer4 = TestRaft.AppendEntriesResponse{
+        .term = raft.current_term,
+        .success = true,
+        .next_prev_index = 10,
+    };
+    raft.handleRPC(3, .{ .append_entries_response = aer4 });
+
+    try testing.expect(raft.next_index[3] == 11);
+    try testing.expect(raft.match_index[3] == 10);
+    try testing.expect(raft.commit_index == 10);
 }

@@ -34,7 +34,8 @@ pub fn Raft(UserData: type, Entry: type) type {
             // if success, it is the last log idx
             // allows to detect stale messages, decouples the response from AE itself
             // and makes the AE response idempotent
-            next_index: u32,
+            // TODO: maybe just next_index would do?
+            next_prev_index: u32,
         };
 
         pub const RequestVote = struct {
@@ -131,6 +132,9 @@ pub fn Raft(UserData: type, Entry: type) type {
             if (self.state != .leader) return error.NotALeader;
 
             try self.log.append(.{ .term = self.current_term, .entry = entry });
+
+            self.next_index[self.id] = @as(u32, @intCast(self.log.items.len)) + 1;
+            self.match_index[self.id] = @intCast(self.log.items.len);
 
             std.log.info("Entry {any} appended, sending AppendEntries\n", .{entry});
 
@@ -391,10 +395,44 @@ pub fn Raft(UserData: type, Entry: type) type {
             if (msg.term < self.current_term) return;
             if (self.state != .leader) return;
 
-            // stale message, match_index never decreases
-            if (msg.next_index < self.match_index[id]) return;
+            // stale message
+            if (msg.next_prev_index < self.match_index[id]) return;
 
             std.log.info("Received AppendEntriesResponse from {d}\n", .{id});
+
+            if (!msg.success) {
+                // only when we succeed the next_prev_index can be equal
+                // to the last index, otherwise is must be smaller
+                assert(msg.next_prev_index < self.log.items.len);
+                // assuming correct operation, next_index should always decrease by 1
+                assert(self.next_index[id] - 2 == msg.next_prev_index);
+
+                self.next_index[id] = msg.next_prev_index + 1;
+                assert(self.next_index[id] > 0);
+
+                self.sendAppendEntries(id);
+                return;
+            }
+
+            assert(msg.next_prev_index <= self.log.items.len);
+
+            self.next_index[id] = msg.next_prev_index + 1;
+            self.match_index[id] = msg.next_prev_index;
+
+            for ((self.commit_index + 1)..(msg.next_prev_index + 1)) |idx| {
+                if (self.log.items[idx - 1].term == self.current_term) {
+                    var votes: u32 = 0;
+                    for (self.match_index) |repl_idx| {
+                        if (repl_idx >= idx) votes += 1;
+                    }
+
+                    if (votes >= self.server_no / 2 + 1) {
+                        self.commit_index = @intCast(idx);
+                    }
+                }
+            }
+
+            if (self.next_index[id] <= self.log.items.len) self.sendAppendEntries(id);
         }
 
         fn handleNewerTerm(self: *Self, msg_term: u32) void {
@@ -420,8 +458,10 @@ pub fn Raft(UserData: type, Entry: type) type {
             const response = AppendEntriesResponse{
                 .term = self.current_term,
                 .success = success,
-                // TODO: temporary
-                .next_index = 0,
+                // assuming we delete conflicting messages right away
+                // this always will be correct value matching the definition at the begining of
+                // the Raft struct
+                .next_prev_index = @intCast(self.log.items.len),
             };
 
             const rpc = .{ .append_entries_response = response };
