@@ -28,13 +28,12 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub const AppendEntriesResponse = struct {
             term: u32,
             success: bool,
-            // non-Raft field
+            // next_prev_index does not come from the Raft paper
             // it is what the follower expects to receive in next prev_log_idx
             // if !success, it is the last conflicting idx (so prev_log_idx) - 1
             // if success, it is the last log idx
             // allows to detect stale messages, decouples the response from AE itself
             // and makes the AE response idempotent
-            // TODO: maybe just next_index would do?
             next_prev_index: u32,
         };
 
@@ -64,6 +63,8 @@ pub fn Raft(UserData: type, Entry: type) type {
 
         state: State,
         timeout: u64,
+
+        current_leader: ?u32 = null,
 
         // TODO: these need to be persisted after change
         current_term: u32 = 0,
@@ -107,6 +108,10 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.allocator.free(self.received_votes);
         }
 
+        pub fn getCurrentLeader(self: *const Self) ?u32 {
+            return self.current_leader;
+        }
+
         pub fn tick(self: *Self) u64 {
             const time = getTime();
             if (self.timeout > time) {
@@ -120,7 +125,12 @@ pub fn Raft(UserData: type, Entry: type) type {
                 else => self.convertToCandidate(time),
             }
 
-            // TODO: apply commited entries here?
+            if (self.commit_index > self.last_applied) {
+                for (self.commit_index..(self.last_applied + 1)) |_| {
+                    // TODO: apply the entries
+                    // TODO: return info to the user that an entry has been applied
+                }
+            }
 
             // return min(remaining time, hearteat_timeout), even when
             // we aren't the leader (we might get elected quickly, and thus cannot
@@ -182,10 +192,13 @@ pub fn Raft(UserData: type, Entry: type) type {
             std.log.info("Converted to leader\n", .{});
 
             self.state = .leader;
+            self.current_leader = self.id;
             for (self.next_index, self.match_index) |*ni, *mi| {
                 ni.* = @as(u32, @intCast(self.log.items.len)) + 1;
                 mi.* = 0;
             }
+
+            // TODO: commit the no-op entry
 
             self.sendHeartbeat(getTime());
         }
@@ -316,7 +329,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
                 if (self.state == .candidate) self.convertToFollower();
 
-                // TODO: set current leader to msg.leader_id
+                self.current_leader = msg.leader_id;
 
                 // if prev_log_index == 0, this is the very first entry
                 if (msg.prev_log_index != 0) {
@@ -432,6 +445,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 }
             }
 
+            // entries appended in `tick` function
             if (self.next_index[id] <= self.log.items.len) self.sendAppendEntries(id);
         }
 
