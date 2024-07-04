@@ -31,7 +31,7 @@ test "converts to follower after receiving RPC with greater term" {
         .last_log_term = initial_term + 1,
         .last_log_index = 50,
     };
-    raft.handleRPC(1, .{ .request_vote = rv });
+    raft.handleRPC(.{ .request_vote = rv });
 
     try testing.expect(raft.state == .follower);
     try testing.expect(raft.current_term == initial_term + 1);
@@ -94,7 +94,7 @@ test "follower respects heartbeats" {
         .entries = &.{},
         .leader_commit = 0,
     };
-    raft.handleRPC(1, .{ .append_entries = ae });
+    raft.handleRPC(.{ .append_entries = ae });
 
     try testing.expect(raft.state == .follower);
     _ = raft.tick();

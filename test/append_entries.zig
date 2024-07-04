@@ -29,7 +29,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
             .entries = leader_log[(idx - 1)..],
             .leader_commit = 2,
         };
-        raft.handleRPC(leader_id, .{ .append_entries = ae });
+        raft.handleRPC(.{ .append_entries = ae });
 
         switch (rpcs[leader_id]) {
             .append_entries_response => |aer| {
@@ -199,7 +199,7 @@ test "stale AppendEntries does not shorten followers log" {
         .entries = log[6..],
         .leader_commit = 0,
     };
-    raft.handleRPC(leader_id, .{ .append_entries = ae });
+    raft.handleRPC(.{ .append_entries = ae });
 
     switch (rpcs[leader_id]) {
         .append_entries_response => |aer| {
@@ -226,7 +226,7 @@ test "stale AppendEntries does not shorten followers log" {
         .entries = log[6..7],
         .leader_commit = 0,
     };
-    raft.handleRPC(leader_id, .{ .append_entries = ae2 });
+    raft.handleRPC(.{ .append_entries = ae2 });
 
     switch (rpcs[leader_id]) {
         .append_entries_response => |aer| {
@@ -309,8 +309,9 @@ test "leader handles AppendEntriesResponse" {
         .term = raft.current_term,
         .success = false,
         .next_prev_index = 7,
+        .responder_id = follower_id,
     };
-    raft.handleRPC(follower_id, .{ .append_entries_response = aer });
+    raft.handleRPC(.{ .append_entries_response = aer });
 
     switch (rpcs[follower_id]) {
         .append_entries => |ae| {
@@ -333,8 +334,9 @@ test "leader handles AppendEntriesResponse" {
         .term = raft.current_term,
         .success = false,
         .next_prev_index = 6,
+        .responder_id = follower_id,
     };
-    raft.handleRPC(follower_id, .{ .append_entries_response = aer2 });
+    raft.handleRPC(.{ .append_entries_response = aer2 });
 
     switch (rpcs[follower_id]) {
         .append_entries => |ae| {
@@ -352,7 +354,7 @@ test "leader handles AppendEntriesResponse" {
     }
 
     // some dummy value so we can later assert that the raft did not sent another AE
-    rpcs[follower_id] = .{ .request_vote_response = TestRaft.RequestVoteResponse{ .term = 0, .vote_granted = false } };
+    rpcs[follower_id] = .{ .request_vote_response = TestRaft.RequestVoteResponse{ .term = 0, .vote_granted = false, .responder_id = 0 } };
 
     try testing.expect(raft.next_index[follower_id] == 7);
     try testing.expect(raft.match_index[follower_id] == 0);
@@ -361,8 +363,9 @@ test "leader handles AppendEntriesResponse" {
         .term = raft.current_term,
         .success = true,
         .next_prev_index = 8,
+        .responder_id = follower_id,
     };
-    raft.handleRPC(follower_id, .{ .append_entries_response = aer3 });
+    raft.handleRPC(.{ .append_entries_response = aer3 });
 
     switch (rpcs[follower_id]) {
         .append_entries => return error.TestUnexpectedResult,
@@ -383,23 +386,29 @@ test "leader commits entries after replicating on majority of servers" {
 
     try raft.appendEntry(5);
 
-    const aer = TestRaft.AppendEntriesResponse{
+    var aer = TestRaft.AppendEntriesResponse{
         .success = true,
         .term = raft.current_term,
         .next_prev_index = 1,
+        .responder_id = 1,
     };
-    raft.handleRPC(1, .{ .append_entries_response = aer });
+    raft.handleRPC(.{ .append_entries_response = aer });
     try testing.expect(raft.commit_index == 0);
 
     // duplicate message, should be ignored
-    raft.handleRPC(1, .{ .append_entries_response = aer });
+    aer.responder_id = 1;
+    raft.handleRPC(.{ .append_entries_response = aer });
     try testing.expect(raft.commit_index == 0);
 
-    raft.handleRPC(2, .{ .append_entries_response = aer });
+    aer.responder_id = 2;
+    raft.handleRPC(.{ .append_entries_response = aer });
     try testing.expect(raft.commit_index == 1);
 
     // the rest of responsed shouldn't change anything
-    for (3..5) |id| raft.handleRPC(@intCast(id), .{ .append_entries_response = aer });
+    for (3..5) |id| {
+        aer.responder_id = @intCast(id);
+        raft.handleRPC(.{ .append_entries_response = aer });
+    }
 
     try testing.expect(raft.commit_index == 1);
     for (0..5) |id| try testing.expect(raft.match_index[id] == 1);
@@ -441,8 +450,9 @@ test "leader does not commit entires from previous terms" {
         .term = raft.current_term,
         .success = true,
         .next_prev_index = 7,
+        .responder_id = 4,
     };
-    raft.handleRPC(4, .{ .append_entries_response = aer1 });
+    raft.handleRPC(.{ .append_entries_response = aer1 });
 
     // nothing should change so far
     try testing.expect(raft.next_index[4] == 8);
@@ -453,8 +463,9 @@ test "leader does not commit entires from previous terms" {
         .term = raft.current_term,
         .success = true,
         .next_prev_index = 9,
+        .responder_id = 1,
     };
-    raft.handleRPC(1, .{ .append_entries_response = aer2 });
+    raft.handleRPC(.{ .append_entries_response = aer2 });
 
     // now the 6th entry should be replicated by majority of the servers
     // but (because of old term) it should not be commited just yet
@@ -466,8 +477,9 @@ test "leader does not commit entires from previous terms" {
         .term = raft.current_term,
         .success = true,
         .next_prev_index = 10,
+        .responder_id = 2,
     };
-    raft.handleRPC(2, .{ .append_entries_response = aer3 });
+    raft.handleRPC(.{ .append_entries_response = aer3 });
 
     // now 9th entry is replicated on majority of the servers
     // and it's term is equal to the current term
@@ -480,8 +492,9 @@ test "leader does not commit entires from previous terms" {
         .term = raft.current_term,
         .success = true,
         .next_prev_index = 10,
+        .responder_id = 3,
     };
-    raft.handleRPC(3, .{ .append_entries_response = aer4 });
+    raft.handleRPC(.{ .append_entries_response = aer4 });
 
     try testing.expect(raft.next_index[3] == 11);
     try testing.expect(raft.match_index[3] == 10);

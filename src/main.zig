@@ -35,6 +35,8 @@ pub fn Raft(UserData: type, Entry: type) type {
             // allows to detect stale messages, decouples the response from AE itself
             // and makes the AE response idempotent
             next_prev_index: u32,
+            // non-Raft field, just for the sake of convinience
+            responder_id: u32,
         };
 
         pub const RequestVote = struct {
@@ -47,6 +49,8 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub const RequestVoteResponse = struct {
             term: u32,
             vote_granted: bool,
+            // non-Raft field, just for the sake of convinience
+            responder_id: u32,
         };
 
         pub const RPC = union(enum) {
@@ -252,19 +256,19 @@ pub fn Raft(UserData: type, Entry: type) type {
             };
         }
 
-        pub fn handleRPC(self: *Self, id: u32, rpc: RPC) void {
-            assert(id != self.id);
-            assert(id < self.server_no);
-
+        pub fn handleRPC(self: *Self, rpc: RPC) void {
             switch (rpc) {
                 .request_vote => |msg| self.handleRequestVote(msg),
-                .request_vote_response => |msg| self.handleRequestVoteResponse(msg, id),
+                .request_vote_response => |msg| self.handleRequestVoteResponse(msg),
                 .append_entries => |msg| self.handleAppendEntries(msg),
-                .append_entries_response => |msg| self.handleAppendEntriesResponse(msg, id),
+                .append_entries_response => |msg| self.handleAppendEntriesResponse(msg),
             }
         }
 
         fn handleRequestVote(self: *Self, msg: RequestVote) void {
+            assert(msg.candidate_id < self.server_no);
+            assert(msg.candidate_id != self.id);
+
             self.handleNewerTerm(msg.term);
 
             const vote_granted = blk: {
@@ -302,24 +306,30 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.timeout = newElectionTimeout(getTime());
         }
 
-        fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse, id: u32) void {
+        fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse) void {
+            assert(msg.responder_id < self.server_no);
+            assert(msg.responder_id != self.id);
+
             self.handleNewerTerm(msg.term);
 
             if (msg.term < self.current_term) return;
             if (self.state != .candidate) return;
 
-            self.received_votes[id] = msg.vote_granted;
+            self.received_votes[msg.responder_id] = msg.vote_granted;
 
             var total_votes: u32 = 0;
             for (self.received_votes) |vote| {
                 if (vote) total_votes += 1;
             }
-            std.log.info("Received RequestVoteResponse from {d}, vote_granted: {any}, total votes: {d}\n", .{ id, msg.vote_granted, total_votes });
+            std.log.info("Received RequestVoteResponse from {d}, vote_granted: {any}, total votes: {d}\n", .{ msg.responder_id, msg.vote_granted, total_votes });
 
             if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
 
         fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
+            assert(msg.leader_id < self.server_no);
+            assert(msg.leader_id != self.id);
+
             self.handleNewerTerm(msg.term);
 
             const success = blk: {
@@ -402,35 +412,38 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.timeout = newElectionTimeout(getTime());
         }
 
-        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse, id: u32) void {
+        fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse) void {
+            assert(msg.responder_id < self.server_no);
+            assert(msg.responder_id != self.id);
+
             self.handleNewerTerm(msg.term);
 
             if (msg.term < self.current_term) return;
             if (self.state != .leader) return;
 
             // stale message
-            if (msg.next_prev_index < self.match_index[id]) return;
+            if (msg.next_prev_index < self.match_index[msg.responder_id]) return;
 
-            std.log.info("Received AppendEntriesResponse from {d}\n", .{id});
+            std.log.info("Received AppendEntriesResponse from {d}\n", .{msg.responder_id});
 
             if (!msg.success) {
                 // only when we succeed the next_prev_index can be equal
                 // to the last index, otherwise is must be smaller
                 assert(msg.next_prev_index < self.log.items.len);
                 // assuming correct operation, next_index should always decrease by 1
-                assert(self.next_index[id] - 2 == msg.next_prev_index);
+                assert(self.next_index[msg.responder_id] - 2 == msg.next_prev_index);
 
-                self.next_index[id] = msg.next_prev_index + 1;
-                assert(self.next_index[id] > 0);
+                self.next_index[msg.responder_id] = msg.next_prev_index + 1;
+                assert(self.next_index[msg.responder_id] > 0);
 
-                self.sendAppendEntries(id);
+                self.sendAppendEntries(msg.responder_id);
                 return;
             }
 
             assert(msg.next_prev_index <= self.log.items.len);
 
-            self.next_index[id] = msg.next_prev_index + 1;
-            self.match_index[id] = msg.next_prev_index;
+            self.next_index[msg.responder_id] = msg.next_prev_index + 1;
+            self.match_index[msg.responder_id] = msg.next_prev_index;
 
             for ((self.commit_index + 1)..(msg.next_prev_index + 1)) |idx| {
                 if (self.log.items[idx - 1].term == self.current_term) {
@@ -446,7 +459,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             }
 
             // entries appended in `tick` function
-            if (self.next_index[id] <= self.log.items.len) self.sendAppendEntries(id);
+            if (self.next_index[msg.responder_id] <= self.log.items.len) self.sendAppendEntries(msg.responder_id);
         }
 
         fn handleNewerTerm(self: *Self, msg_term: u32) void {
@@ -460,6 +473,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             const response = RequestVoteResponse{
                 .term = self.current_term,
                 .vote_granted = vote_granted,
+                .responder_id = self.id,
             };
 
             const rpc = .{ .request_vote_response = response };
@@ -476,6 +490,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 // this always will be correct value matching the definition at the begining of
                 // the Raft struct
                 .next_prev_index = @intCast(self.log.items.len),
+                .responder_id = self.id,
             };
 
             const rpc = .{ .append_entries_response = response };

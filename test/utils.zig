@@ -31,8 +31,12 @@ pub fn setupTestRaft(rpcs: *TestRPCs, elect_leader: bool) TestRaft {
     _ = raft.tick();
 
     for (1..len) |id| {
-        const rvr = TestRaft.RequestVoteResponse{ .term = raft.current_term, .vote_granted = true };
-        raft.handleRPC(@intCast(id), .{ .request_vote_response = rvr });
+        const rvr = TestRaft.RequestVoteResponse{
+            .term = raft.current_term,
+            .vote_granted = true,
+            .responder_id = @intCast(id),
+        };
+        raft.handleRPC(.{ .request_vote_response = rvr });
     }
 
     return raft;
