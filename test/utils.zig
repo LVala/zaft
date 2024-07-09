@@ -13,13 +13,8 @@ pub fn getTime() u64 {
 pub fn setupTestRaft(rpcs: *TestRPCs, elect_leader: bool) TestRaft {
     const callbacks = TestRaft.Callbacks{
         .user_data = rpcs,
-        .makeRPC = struct {
-            pub fn makeRPC(ud: *anyopaque, id: u32, rpc: TestRaft.RPC) !void {
-                // TODO: I don't know what I did here
-                const ud_rpcs = @as(*TestRPCs, @alignCast(@ptrCast(ud)));
-                ud_rpcs.*[id] = rpc;
-            }
-        }.makeRPC,
+        .makeRPC = makeRPC,
+        .applyEntry = applyEntry,
     };
 
     // our Raft always gets the id 0
@@ -40,4 +35,15 @@ pub fn setupTestRaft(rpcs: *TestRPCs, elect_leader: bool) TestRaft {
     }
 
     return raft;
+}
+
+fn makeRPC(ud: *anyopaque, id: u32, rpc: TestRaft.RPC) !void {
+    // TODO: I don't know what I did here
+    const ud_rpcs = @as(*TestRPCs, @alignCast(@ptrCast(ud)));
+    ud_rpcs.*[id] = rpc;
+}
+
+fn applyEntry(ud: *anyopaque, entry: u32) !void {
+    _ = ud;
+    _ = entry;
 }

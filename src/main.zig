@@ -14,6 +14,7 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub const Callbacks = struct {
             user_data: *UserData,
             makeRPC: *const fn (user_data: *UserData, id: u32, rpc: RPC) anyerror!void,
+            applyEntry: *const fn (user_data: *UserData, entry: Entry) anyerror!void,
         };
 
         pub const AppendEntries = struct {
@@ -127,13 +128,6 @@ pub fn Raft(UserData: type, Entry: type) type {
             switch (self.state) {
                 .leader => self.sendHeartbeat(time),
                 else => self.convertToCandidate(time),
-            }
-
-            if (self.commit_index > self.last_applied) {
-                for (self.commit_index..(self.last_applied + 1)) |_| {
-                    // TODO: apply the entries
-                    // TODO: return info to the user that an entry has been applied
-                }
             }
 
             // return min(remaining time, hearteat_timeout), even when
@@ -400,6 +394,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
                 if (msg.leader_commit > self.commit_index) {
                     self.commit_index = @min(msg.leader_commit, self.log.items.len);
+                    self.applyEntries();
                 }
 
                 break :blk true;
@@ -458,7 +453,8 @@ pub fn Raft(UserData: type, Entry: type) type {
                 }
             }
 
-            // entries appended in `tick` function
+            self.applyEntries();
+
             if (self.next_index[msg.responder_id] <= self.log.items.len) self.sendAppendEntries(msg.responder_id);
         }
 
@@ -497,6 +493,16 @@ pub fn Raft(UserData: type, Entry: type) type {
             self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
                 std.log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}\n", .{ to, err });
             };
+        }
+
+        fn applyEntries(self: *Self) void {
+            while (self.commit_index > self.last_applied) {
+                self.last_applied += 1;
+                const entry = self.log.items[self.last_applied - 1].entry;
+                self.callbacks.applyEntry(self.callbacks.user_data, entry) catch |err| {
+                    std.debug.panic("Applying new entry {any} failed: {any}\n", .{ entry, err });
+                };
+            }
         }
 
         fn newElectionTimeout(time: u64) u64 {

@@ -52,6 +52,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
     try testing.expect(raft.state == .follower);
     try testing.expect(raft.current_term == leader_term);
     try testing.expect(raft.commit_index == 2);
+    try testing.expect(raft.last_applied == 2);
 }
 
 test "follower adds new entries from AppendEntries" {
@@ -487,6 +488,7 @@ test "leader does not commit entires from previous terms" {
     try testing.expect(raft.next_index[2] == 11);
     try testing.expect(raft.match_index[2] == 10);
     try testing.expect(raft.commit_index == 9);
+    try testing.expect(raft.last_applied == 9);
 
     const aer4 = TestRaft.AppendEntriesResponse{
         .term = raft.current_term,
@@ -499,4 +501,5 @@ test "leader does not commit entires from previous terms" {
     try testing.expect(raft.next_index[3] == 11);
     try testing.expect(raft.match_index[3] == 10);
     try testing.expect(raft.commit_index == 10);
+    try testing.expect(raft.last_applied == 10);
 }
