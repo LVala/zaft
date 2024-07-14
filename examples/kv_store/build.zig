@@ -5,7 +5,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const zaft = b.dependency("zaft", .{ .target = target, .optimize = optimize });
-    const xev = b.dependency("libxev", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "kv_store",
@@ -15,7 +14,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addImport("zaft", zaft.module("zaft"));
-    exe.root_module.addImport("xev", xev.module("xev"));
 
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
