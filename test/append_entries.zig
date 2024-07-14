@@ -253,7 +253,11 @@ test "leader sends AppendEntries on initial entry" {
     const initial_term = raft.current_term;
 
     const entries = [_]u32{ 1, 2, 3 };
-    for (entries) |entry| try raft.appendEntry(entry);
+    for (entries) |entry| {
+        const idx = try raft.appendEntry(entry);
+        // appendEntries returns the index of the newly appended entry
+        try testing.expect(idx == entry);
+    }
 
     // initial AppendEntries heartbeat
     for (rpcs[1..]) |rpc| {
@@ -385,7 +389,7 @@ test "leader commits entries after replicating on majority of servers" {
 
     try testing.expect(raft.commit_index == 0);
 
-    try raft.appendEntry(5);
+    _ = try raft.appendEntry(5);
 
     var aer = TestRaft.AppendEntriesResponse{
         .success = true,

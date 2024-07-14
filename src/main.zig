@@ -117,6 +117,10 @@ pub fn Raft(UserData: type, Entry: type) type {
             return self.current_leader;
         }
 
+        pub fn checkIfApplied(self: *const Self, idx: u32) bool {
+            return idx <= self.last_applied;
+        }
+
         pub fn tick(self: *Self) u64 {
             const time = getTime();
             if (self.timeout > time) {
@@ -136,7 +140,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             return @min(self.timeout - time, heartbeat_timeout);
         }
 
-        pub fn appendEntry(self: *Self, entry: Entry) !void {
+        pub fn appendEntry(self: *Self, entry: Entry) !u32 {
             if (self.state != .leader) return error.NotALeader;
 
             try self.log.append(.{ .term = self.current_term, .entry = entry });
@@ -152,6 +156,8 @@ pub fn Raft(UserData: type, Entry: type) type {
             }
 
             self.timeout = newHeartbeatTimeout(getTime());
+
+            return @intCast(self.log.items.len);
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
