@@ -6,10 +6,24 @@ const Ticker = @import("ticker.zig").Ticker;
 const ClientServer = server.ClientServer;
 const RaftServer = server.RaftServer;
 
-pub const Entry = struct {};
+pub const Add = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const Remove = struct {
+    key: []const u8,
+};
+
+pub const Entry = union(enum) {
+    add: Add,
+    remove: Remove,
+};
+
 const UserData = struct {
     allocator: std.mem.Allocator,
     addresses: []const []const u8,
+    store: *std.StringHashMap([]const u8),
     cond: *std.Thread.Condition,
 };
 
@@ -28,9 +42,6 @@ pub fn main() !void {
     _ = args.next();
     const self_id = try std.fmt.parseInt(usize, args.next().?, 10);
 
-    var mutex = std.Thread.Mutex{};
-    var cond = std.Thread.Condition{};
-
     const addresses = try allocator.alloc([]u8, raft_addresses.len);
     defer allocator.free(addresses);
 
@@ -38,9 +49,16 @@ pub fn main() !void {
         address.* = try std.fmt.allocPrint(allocator, "http://{s}/", .{raw_address});
     }
 
+    var mutex = std.Thread.Mutex{};
+    var cond = std.Thread.Condition{};
+
+    var store = std.StringHashMap([]const u8).init(allocator);
+    defer store.deinit();
+
     var user_data = UserData{
         .allocator = allocator,
         .addresses = addresses,
+        .store = &store,
         .cond = &cond,
     };
     const callbacks = Raft.Callbacks{
@@ -50,15 +68,30 @@ pub fn main() !void {
     };
     var raft = try Raft.init(@intCast(self_id), @intCast(raft_addresses.len), callbacks, allocator);
 
-    var ticker = Ticker.init(&raft, &mutex);
-    try ticker.run_in_thread();
+    var ticker = Ticker{ .raft = &raft, .mutex = &mutex };
+    const ticker_thread = try std.Thread.spawn(.{}, Ticker.run, .{&ticker});
+    ticker_thread.detach();
 
     const raft_address = try parseAddress(raft_addresses[self_id]);
-    var raft_server = try RaftServer.init(raft_address, &raft, &mutex, &cond, allocator);
-    try raft_server.run_in_thread();
+    var raft_server = RaftServer{
+        .raft = &raft,
+        .mutex = &mutex,
+        .address = raft_address,
+        .allocator = allocator,
+    };
+    const raft_thread = try std.Thread.spawn(.{}, RaftServer.run, .{&raft_server});
+    raft_thread.detach();
 
     const client_address = try parseAddress(client_addresses[self_id]);
-    var client_server = try ClientServer.init(client_address, &raft, &mutex, &cond, allocator);
+    var client_server = ClientServer{
+        .raft = &raft,
+        .cond = &cond,
+        .mutex = &mutex,
+        .store = &store,
+        .address = client_address,
+        .addresses = addresses,
+        .allocator = allocator,
+    };
     try client_server.run();
 }
 
@@ -76,7 +109,7 @@ fn makeRPC(user_data: *UserData, id: u32, rpc: Raft.RPC) !void {
     const json = try std.json.stringifyAlloc(user_data.allocator, rpc, .{});
     defer user_data.allocator.free(json);
 
-    request.transfer_encoding = .{ .content_length = json.len };
+    request.transfer_encoding = .chunked;
 
     try request.send();
     try request.writeAll(json);
@@ -85,7 +118,16 @@ fn makeRPC(user_data: *UserData, id: u32, rpc: Raft.RPC) !void {
 }
 
 fn applyEntry(user_data: *UserData, entry: Entry) !void {
-    _ = entry;
+    switch (entry) {
+        .remove => |ent| {
+            // we do not free the memory for the key/value
+            // as it still is used by the entry in the log
+            _ = user_data.store.remove(ent.key);
+        },
+        .add => |ent| {
+            try user_data.store.put(ent.key, ent.value);
+        },
+    }
 
     user_data.cond.signal();
 }

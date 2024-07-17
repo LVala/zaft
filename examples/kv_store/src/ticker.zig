@@ -8,15 +8,6 @@ pub const Ticker = struct {
 
     const Self = @This();
 
-    pub fn init(raft: *Raft, mutex: *std.Thread.Mutex) Self {
-        return Self{ .raft = raft, .mutex = mutex };
-    }
-
-    pub fn run_in_thread(self: *Self) !void {
-        const thread = try std.Thread.spawn(.{}, run, .{self});
-        thread.detach();
-    }
-
     pub fn run(self: *Self) void {
         while (true) {
             self.mutex.lock();
