@@ -1,6 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const log = std.log.scoped(.raft);
+
 pub fn Raft(UserData: type, Entry: type) type {
     return struct {
         const State = enum { follower, candidate, leader };
@@ -89,7 +91,7 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub fn init(id: u32, server_no: u32, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
             assert(id < server_no);
 
-            std.log.info("Initializing Raft, id: {d}, number of servers: {d}\n", .{ id, server_no });
+            log.info("Initializing Raft, id: {}, number of servers: {}", .{ id, server_no });
 
             const time = getTime();
             return Self{
@@ -143,12 +145,14 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub fn appendEntry(self: *Self, entry: Entry) !u32 {
             if (self.state != .leader) return error.NotALeader;
 
-            try self.log.append(.{ .term = self.current_term, .entry = entry });
+            const log_entry = LogEntry{ .term = self.current_term, .entry = entry };
+            try self.log.append(log_entry);
 
+            // just for the sake of being consistend with next index and match index for other servers
             self.next_index[self.id] = @as(u32, @intCast(self.log.items.len)) + 1;
             self.match_index[self.id] = @intCast(self.log.items.len);
 
-            std.log.info("Entry {any} appended, sending AppendEntries\n", .{entry});
+            log.info("Appended entry, term: {}, index: {}, entry: {}", .{ log_entry.term, self.log.items.len, entry });
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
@@ -161,8 +165,6 @@ pub fn Raft(UserData: type, Entry: type) type {
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
-            std.log.info("Sending heartbeat\n", .{});
-
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
                 self.sendAppendEntries(@intCast(idx));
@@ -180,7 +182,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             }
             self.received_votes[self.id] = true;
 
-            std.log.info("Converted to candidate, starting new election, term: {d}\n", .{self.current_term});
+            log.info("Converted to candidate, term: {}", .{self.current_term});
 
             for (0..self.server_no) |idx| {
                 if (idx == self.id) continue;
@@ -193,7 +195,7 @@ pub fn Raft(UserData: type, Entry: type) type {
         fn convertToLeader(self: *Self) void {
             assert(self.state != .leader);
 
-            std.log.info("Converted to leader\n", .{});
+            log.info("Converted to leader, term: {}", .{self.current_term});
 
             self.state = .leader;
             self.current_leader = self.id;
@@ -208,7 +210,7 @@ pub fn Raft(UserData: type, Entry: type) type {
         }
 
         fn convertToFollower(self: *Self) void {
-            std.log.info("Converted to follower\n", .{});
+            log.info("Converted to follower, term: {}", .{self.current_term});
 
             self.state = .follower;
             self.voted_for = null;
@@ -229,8 +231,16 @@ pub fn Raft(UserData: type, Entry: type) type {
             const rpc = .{ .request_vote = request_vote };
 
             self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
-                std.log.warn("Sending RequestVote to server {d} failed: {any}\n", .{ to, err });
+                log.warn("Sending RequestVote to server {} failed: {}", .{ to, err });
+                return;
             };
+
+            log.debug("Sent RequestVote to {}, term: {}, ll_index: {}, ll_term: {}", .{
+                to,
+                request_vote.term,
+                request_vote.last_log_index,
+                request_vote.last_log_term,
+            });
         }
 
         fn sendAppendEntries(self: *Self, to: u32) void {
@@ -252,8 +262,18 @@ pub fn Raft(UserData: type, Entry: type) type {
             const rpc = .{ .append_entries = append_entries };
 
             self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
-                std.log.warn("Sending AppendEntries to server {d} failed: {any}\n", .{ to, err });
+                log.warn("Sending AppendEntries to server {} failed: {}", .{ to, err });
+                return;
             };
+
+            log.debug("Sent AppendEntries to {}, term: {}, pl_index: {}, pl_term: {}, l_commit: {}, entries number: {any}", .{
+                to,
+                append_entries.term,
+                append_entries.prev_log_index,
+                append_entries.prev_log_term,
+                append_entries.leader_commit,
+                append_entries.entries.len,
+            });
         }
 
         pub fn handleRPC(self: *Self, rpc: RPC) void {
@@ -271,18 +291,28 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.handleNewerTerm(msg.term);
 
+            log.debug("Received RequestVote from {}, term: {}, ll_index: {}, ll_term: {}", .{
+                msg.candidate_id,
+                msg.term,
+                msg.last_log_index,
+                msg.last_log_term,
+            });
+
             const vote_granted = blk: {
                 if (msg.term < self.current_term) {
+                    log.debug("Vote not granted, stale message (current term = {})", .{self.current_term});
                     break :blk false;
                 }
 
                 // ensure candidate's log is up-to-date
                 const last_term = if (self.log.getLastOrNull()) |last| last.term else 0;
                 if (msg.last_log_term < last_term) {
+                    log.debug("Vote not granted, log not up-to-date (last log term = {})", .{last_term});
                     break :blk false;
                 }
 
                 if (msg.last_log_term == last_term and msg.last_log_index < self.log.items.len) {
+                    log.debug("Vote not granted, log not up-to-date (last log index = {})", .{self.log.items.len});
                     break :blk false;
                 }
 
@@ -290,16 +320,16 @@ pub fn Raft(UserData: type, Entry: type) type {
                 // this should be false if we are not a follower
                 // as the leader and a candidate would vote for themselves already
                 if (self.voted_for != null and self.voted_for != msg.candidate_id) {
+                    log.debug("Vote not granted, already voted for {any}", .{self.voted_for});
                     break :blk false;
                 }
 
                 assert(self.state == .follower);
 
                 self.voted_for = msg.candidate_id;
+                log.debug("Vote granted, term: {}", .{self.current_term});
                 break :blk true;
             };
-
-            std.log.info("Received RequestVote from server {d} with term {d}, vote_granted: {any}\n", .{ msg.candidate_id, msg.term, vote_granted });
 
             self.sendRequestVoteResponse(msg.candidate_id, vote_granted);
 
@@ -312,8 +342,20 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.handleNewerTerm(msg.term);
 
-            if (msg.term < self.current_term) return;
-            if (self.state != .candidate) return;
+            log.debug("Received RequestVoteResponse from {}, term: {}, vote_granted: {}", .{
+                msg.responder_id,
+                msg.term,
+                msg.vote_granted,
+            });
+
+            if (msg.term < self.current_term) {
+                log.debug("Ignoring RequestVoteResponse: stale message (current term = {})", .{self.current_term});
+                return;
+            }
+            if (self.state != .candidate) {
+                log.debug("Ignoring RequestVoteResponse: not a candidate", .{});
+                return;
+            }
 
             self.received_votes[msg.responder_id] = msg.vote_granted;
 
@@ -321,7 +363,12 @@ pub fn Raft(UserData: type, Entry: type) type {
             for (self.received_votes) |vote| {
                 if (vote) total_votes += 1;
             }
-            std.log.info("Received RequestVoteResponse from {d}, vote_granted: {any}, total votes: {d}\n", .{ msg.responder_id, msg.vote_granted, total_votes });
+
+            log.debug("Vote received: {}, votes: {}/{}", .{
+                msg.vote_granted,
+                total_votes,
+                self.server_no,
+            });
 
             if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
         }
@@ -332,12 +379,25 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.handleNewerTerm(msg.term);
 
+            log.debug("Received AppendEntries from {}, term: {}, pl_index: {}, pl_term: {}, l_commit: {}, entries number: {}", .{
+                msg.leader_id,
+                msg.term,
+                msg.prev_log_index,
+                msg.prev_log_term,
+                msg.leader_commit,
+                msg.entries.len,
+            });
+
             const success = blk: {
                 if (msg.term < self.current_term) {
+                    log.debug("Ignoring AppendEntries: stale message (current term = {})", .{self.current_term});
                     break :blk false;
                 }
 
-                if (self.state == .candidate) self.convertToFollower();
+                if (self.state == .candidate) {
+                    log.debug("Received AppendEntries while being candidate", .{});
+                    self.convertToFollower();
+                }
 
                 self.current_leader = msg.leader_id;
 
@@ -345,6 +405,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 if (msg.prev_log_index != 0) {
                     // make sure the index and term of previous entry match
                     if (self.log.items.len < msg.prev_log_index) {
+                        log.debug("Entries not appended: local log too short (last index = {})", .{self.log.items.len});
                         break :blk false;
                     }
 
@@ -358,6 +419,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
                         // remove conflicting entries
                         self.log.shrinkRetainingCapacity(msg.prev_log_index - 1);
+                        log.debug("Entries not appended: conflicting entry at prev_index (local entry term  = {}), removing subsequent entries", .{entry.term});
                         break :blk false;
                     }
                 }
@@ -374,9 +436,10 @@ pub fn Raft(UserData: type, Entry: type) type {
                         assert(self.log.items[idx - 1].term == entry.term);
                     } else {
                         self.log.append(entry) catch |err| {
-                            std.log.warn("Appending new entry to the log failed: {any}\n", .{err});
+                            log.warn("Appending new entry to the log failed: {}", .{err});
                             break :blk false;
                         };
+                        log.info("Appended entry, term: {}, index: {}, entry: {}", .{ entry.term, self.log.items.len, entry.entry });
                     }
                 }
 
@@ -399,14 +462,14 @@ pub fn Raft(UserData: type, Entry: type) type {
                 // now we remove the invalid entries right with the very first empty AE
 
                 if (msg.leader_commit > self.commit_index) {
-                    self.commit_index = @min(msg.leader_commit, self.log.items.len);
+                    const new_commit_index = @min(msg.leader_commit, self.log.items.len);
+                    log.debug("Commit index changed from {} to {}", .{ self.commit_index, new_commit_index });
+                    self.commit_index = new_commit_index;
                     self.applyEntries();
                 }
 
                 break :blk true;
             };
-
-            std.log.info("Received AppendEntries from server {d} with term {d}, success: {any}\n", .{ msg.leader_id, msg.term, success });
 
             self.sendAppendEntriesResponse(msg.leader_id, success);
 
@@ -419,13 +482,27 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.handleNewerTerm(msg.term);
 
-            if (msg.term < self.current_term) return;
-            if (self.state != .leader) return;
+            log.debug("Received AppendEntriesResponse from {}, term: {}, success: {}, next prev index: {}", .{
+                msg.responder_id,
+                msg.term,
+                msg.success,
+                msg.next_prev_index,
+            });
+
+            if (msg.term < self.current_term) {
+                log.debug("Ignoring AppendEntriesResponse: stale message (current_term = {})", .{self.current_term});
+                return;
+            }
+            if (self.state != .leader) {
+                log.debug("Ignoring AppendEntriesResponse: not a leader", .{});
+                return;
+            }
 
             // stale message
-            if (msg.next_prev_index < self.match_index[msg.responder_id]) return;
-
-            std.log.info("Received AppendEntriesResponse from {d}\n", .{msg.responder_id});
+            if (msg.next_prev_index < self.match_index[msg.responder_id]) {
+                log.debug("Ignoring AppendEntriesResponse: stale message (match index = {})", .{self.match_index[msg.responder_id]});
+                return;
+            }
 
             if (!msg.success) {
                 // only when we succeed the next_prev_index can be equal
@@ -435,6 +512,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 assert(self.next_index[msg.responder_id] - 2 == msg.next_prev_index);
 
                 self.next_index[msg.responder_id] = msg.next_prev_index + 1;
+                log.debug("AppendEntries for {} failed, next index: {}", .{ msg.responder_id, self.next_index[msg.responder_id] });
                 assert(self.next_index[msg.responder_id] > 0);
 
                 self.sendAppendEntries(msg.responder_id);
@@ -445,6 +523,11 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.next_index[msg.responder_id] = msg.next_prev_index + 1;
             self.match_index[msg.responder_id] = msg.next_prev_index;
+            log.debug("AppendEntries for {} succeeded, next index: {}, match index: {}", .{
+                msg.responder_id,
+                self.next_index[msg.responder_id],
+                self.match_index[msg.responder_id],
+            });
 
             for ((self.commit_index + 1)..(msg.next_prev_index + 1)) |idx| {
                 if (self.log.items[idx - 1].term == self.current_term) {
@@ -454,6 +537,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                     }
 
                     if (votes >= self.server_no / 2 + 1) {
+                        log.debug("Commit index changed from {} to {}", .{ self.commit_index, idx });
                         self.commit_index = @intCast(idx);
                     }
                 }
@@ -466,6 +550,8 @@ pub fn Raft(UserData: type, Entry: type) type {
 
         fn handleNewerTerm(self: *Self, msg_term: u32) void {
             if (msg_term > self.current_term) {
+                log.debug("Received message with term {}, which is greater than current term {}", .{ msg_term, self.current_term });
+
                 self.current_term = msg_term;
                 self.convertToFollower();
             }
@@ -480,8 +566,15 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             const rpc = .{ .request_vote_response = response };
             self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
-                std.log.warn("Sending RequestVoteResponse to server {d}, failed: {any}\n", .{ to, err });
+                log.warn("Sending RequestVoteResponse to server {}, failed: {}", .{ to, err });
+                return;
             };
+
+            log.debug("Sent RequestVoteResponse to {}, term: {}, vote_granted: {}", .{
+                to,
+                response.term,
+                response.vote_granted,
+            });
         }
 
         fn sendAppendEntriesResponse(self: *Self, to: u32, success: bool) void {
@@ -497,8 +590,16 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             const rpc = .{ .append_entries_response = response };
             self.callbacks.makeRPC(self.callbacks.user_data, to, rpc) catch |err| {
-                std.log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}\n", .{ to, err });
+                log.warn("Sending AppendEntriesResponse to server {d}, failed: {any}", .{ to, err });
+                return;
             };
+
+            log.debug("Sent AppendEntriesResponse to {}, term: {}, success: {}, next prev index: {}", .{
+                to,
+                response.term,
+                response.success,
+                response.next_prev_index,
+            });
         }
 
         fn applyEntries(self: *Self) void {
@@ -506,8 +607,10 @@ pub fn Raft(UserData: type, Entry: type) type {
                 self.last_applied += 1;
                 const entry = self.log.items[self.last_applied - 1].entry;
                 self.callbacks.applyEntry(self.callbacks.user_data, entry) catch |err| {
-                    std.debug.panic("Applying new entry {any} failed: {any}\n", .{ entry, err });
+                    std.debug.panic("Applying new entry {} failed: {}\n", .{ entry, err });
                 };
+
+                log.info("Applied entry with index {}", .{self.last_applied});
             }
         }
 
