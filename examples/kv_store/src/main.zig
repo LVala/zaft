@@ -42,10 +42,17 @@ pub fn main() !void {
     _ = args.next();
     const self_id = try std.fmt.parseInt(usize, args.next().?, 10);
 
-    const addresses = try allocator.alloc([]u8, raft_addresses.len);
-    defer allocator.free(addresses);
+    const raft_http_addresses = try allocator.alloc([]u8, raft_addresses.len);
+    defer allocator.free(raft_http_addresses);
 
-    for (addresses, raft_addresses) |*address, raw_address| {
+    const client_http_addresses = try allocator.alloc([]u8, client_addresses.len);
+    defer allocator.free(client_http_addresses);
+
+    for (raft_http_addresses, raft_addresses) |*address, raw_address| {
+        address.* = try std.fmt.allocPrint(allocator, "http://{s}/", .{raw_address});
+    }
+
+    for (client_http_addresses, client_addresses) |*address, raw_address| {
         address.* = try std.fmt.allocPrint(allocator, "http://{s}/", .{raw_address});
     }
 
@@ -57,7 +64,7 @@ pub fn main() !void {
 
     var user_data = UserData{
         .allocator = allocator,
-        .addresses = addresses,
+        .addresses = raft_http_addresses,
         .store = &store,
         .cond = &cond,
     };
@@ -89,7 +96,7 @@ pub fn main() !void {
         .mutex = &mutex,
         .store = &store,
         .address = client_address,
-        .addresses = addresses,
+        .addresses = client_http_addresses,
         .allocator = allocator,
     };
     try client_server.run();
