@@ -32,6 +32,10 @@ pub const Raft = zaft.Raft(UserData, Entry);
 const raft_addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001", "127.0.0.1:10002" };
 const client_addresses = [_][]const u8{ "127.0.0.1:20000", "127.0.0.1:20001", "127.0.0.1:20002" };
 
+// const current_term_file = "current_term.txt";
+// const voted_for_file = "voted_for.txt";
+// const log_file = "log.txt";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -62,6 +66,8 @@ pub fn main() !void {
     var store = std.StringHashMap([]const u8).init(allocator);
     defer store.deinit();
 
+    const config = Raft.Config{ .id = @intCast(self_id), .server_no = @intCast(raft_addresses.len) };
+    const initial_state = Raft.InitialState{};
     var user_data = UserData{
         .allocator = allocator,
         .addresses = raft_http_addresses,
@@ -72,8 +78,12 @@ pub fn main() !void {
         .user_data = &user_data,
         .makeRPC = makeRPC,
         .applyEntry = applyEntry,
+        .logAppend = logAppend,
+        .logPop = logPop,
+        .persistCurrentTerm = persistCurrentTerm,
+        .persistVotedFor = persistVotedFor,
     };
-    var raft = try Raft.init(@intCast(self_id), @intCast(raft_addresses.len), callbacks, allocator);
+    var raft = try Raft.init(config, initial_state, callbacks, allocator);
 
     var ticker = Ticker{ .raft = &raft, .mutex = &mutex };
     const ticker_thread = try std.Thread.spawn(.{}, Ticker.run, .{&ticker});
@@ -137,6 +147,26 @@ fn applyEntry(user_data: *UserData, entry: Entry) !void {
     }
 
     user_data.cond.signal();
+}
+
+fn logAppend(ud: *UserData, log_entry: Raft.LogEntry) !void {
+    _ = ud;
+    _ = log_entry;
+}
+
+fn logPop(ud: *UserData) !Raft.LogEntry {
+    _ = ud;
+    return Raft.LogEntry{ .term = 0, .entry = Entry{ .remove = Remove{ .key = "siema" } } };
+}
+
+fn persistVotedFor(ud: *UserData, voted_for: ?u32) !void {
+    _ = ud;
+    _ = voted_for;
+}
+
+fn persistCurrentTerm(ud: *UserData, current_term: u32) !void {
+    _ = ud;
+    _ = current_term;
 }
 
 fn parseAddress(address: []const u8) !std.net.Address {

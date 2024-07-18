@@ -128,7 +128,7 @@ pub const ClientServer = struct {
 
     fn checkValid(self: *Self, request: *http.Server.Request) !void {
         const cur_leader = self.raft.getCurrentLeader();
-        const not_leader = cur_leader != self.raft.id;
+        const not_leader = !self.raft.checkIfLeader();
         const for_leader = request.head.method == .POST or request.head.method == .DELETE;
 
         if (for_leader and not_leader) {

@@ -142,6 +142,10 @@ pub fn Raft(UserData: type, Entry: type) type {
             return self.current_leader;
         }
 
+        pub fn checkIfLeader(self: *const Self) bool {
+            return self.state == .leader;
+        }
+
         pub fn checkIfApplied(self: *const Self, idx: u32) bool {
             return idx <= self.last_applied;
         }
