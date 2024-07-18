@@ -8,15 +8,29 @@ pub fn Raft(UserData: type, Entry: type) type {
         const State = enum { follower, candidate, leader };
         const Self = @This();
 
-        const default_timeout = 1000;
-        const heartbeat_timeout = 500;
-
         pub const LogEntry = struct { term: u32, entry: Entry };
+
+        pub const Config = struct {
+            id: u32,
+            server_no: u32,
+            election_timeout: u64 = 1000,
+            heartbeat_timeout: u64 = 500,
+        };
+
+        pub const InitialState = struct {
+            current_term: ?u32 = null,
+            voted_for: ?u32 = null,
+            log: []LogEntry = &.{},
+        };
 
         pub const Callbacks = struct {
             user_data: *UserData,
             makeRPC: *const fn (user_data: *UserData, id: u32, rpc: RPC) anyerror!void,
             applyEntry: *const fn (user_data: *UserData, entry: Entry) anyerror!void,
+            logAppend: *const fn (user_data: *UserData, entry: LogEntry) anyerror!void,
+            logPop: *const fn (user_data: *UserData) anyerror!LogEntry,
+            persistCurrentTerm: *const fn (user_data: *UserData, current_term: u32) anyerror!void,
+            persistVotedFor: *const fn (user_data: *UserData, voted_for: ?u32) anyerror!void,
         };
 
         pub const AppendEntries = struct {
@@ -63,19 +77,17 @@ pub fn Raft(UserData: type, Entry: type) type {
             request_vote_response: RequestVoteResponse,
         };
 
+        config: Config,
         callbacks: Callbacks,
         allocator: std.mem.Allocator,
-        id: u32,
-        server_no: u32,
 
         state: State,
         timeout: u64,
 
         current_leader: ?u32 = null,
 
-        // TODO: these need to be persisted after change
-        current_term: u32 = 0,
-        voted_for: ?u32 = null,
+        current_term: u32,
+        voted_for: ?u32,
         log: std.ArrayList(LogEntry),
 
         commit_index: u32 = 0,
@@ -88,24 +100,35 @@ pub fn Raft(UserData: type, Entry: type) type {
         // candidate-specific
         received_votes: []bool,
 
-        pub fn init(id: u32, server_no: u32, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
-            assert(id < server_no);
+        pub fn init(config: Config, initial_state: InitialState, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
+            assert(config.id < config.server_no);
 
-            log.info("Initializing Raft, id: {}, number of servers: {}", .{ id, server_no });
+            log.info("Initializing Raft, id: {}, number of servers: {}", .{ config.id, config.server_no });
 
-            const time = getTime();
-            return Self{
+            var self = Self{
+                .config = config,
                 .callbacks = callbacks,
                 .allocator = allocator,
-                .id = id,
-                .server_no = server_no,
                 .state = .follower,
-                .timeout = newElectionTimeout(time),
+                .current_term = initial_state.current_term orelse 0,
+                .voted_for = initial_state.voted_for,
+                .timeout = 0,
                 .log = std.ArrayList(LogEntry).init(allocator),
-                .next_index = try allocator.alloc(u32, server_no),
-                .match_index = try allocator.alloc(u32, server_no),
-                .received_votes = try allocator.alloc(bool, server_no),
+                .next_index = try allocator.alloc(u32, config.server_no),
+                .match_index = try allocator.alloc(u32, config.server_no),
+                .received_votes = try allocator.alloc(bool, config.server_no),
             };
+
+            for (initial_state.log) |entry| {
+                try self.log.append(entry);
+            }
+
+            self.next_index[config.id] = @as(u32, @intCast(self.log.items.len)) + 1;
+            self.match_index[config.id] = @intCast(self.log.items.len);
+
+            self.setElectionTimeout(getTime());
+
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
@@ -128,7 +151,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             if (self.timeout > time) {
                 // too early!
                 const remaining = self.timeout - time;
-                return if (self.state == .follower) remaining else @min(remaining, heartbeat_timeout);
+                return if (self.state == .follower) remaining else @min(remaining, self.config.heartbeat_timeout);
             }
 
             switch (self.state) {
@@ -139,57 +162,58 @@ pub fn Raft(UserData: type, Entry: type) type {
             // return min(remaining time, hearteat_timeout), even when
             // we aren't the leader (we might get elected quickly, and thus cannot
             // wait for the whole election_timeout to start sending hearbeats)
-            return @min(self.timeout - time, heartbeat_timeout);
+            return @min(self.timeout - time, self.config.heartbeat_timeout);
         }
 
         pub fn appendEntry(self: *Self, entry: Entry) !u32 {
             if (self.state != .leader) return error.NotALeader;
 
             const log_entry = LogEntry{ .term = self.current_term, .entry = entry };
-            try self.log.append(log_entry);
+            self.appendLogEntry(log_entry);
 
-            // just for the sake of being consistend with next index and match index for other servers
-            self.next_index[self.id] = @as(u32, @intCast(self.log.items.len)) + 1;
-            self.match_index[self.id] = @intCast(self.log.items.len);
+            // just for the sake of being consistent with next_index and match_index for other servers
+            self.next_index[self.config.id] = @as(u32, @intCast(self.log.items.len)) + 1;
+            self.match_index[self.config.id] = @intCast(self.log.items.len);
 
             log.info("Appended entry, term: {}, index: {}, entry: {}", .{ log_entry.term, self.log.items.len, entry });
 
-            for (0..self.server_no) |idx| {
-                if (idx == self.id) continue;
+            for (0..self.config.server_no) |idx| {
+                if (idx == self.config.id) continue;
                 self.sendAppendEntries(@intCast(idx));
             }
 
-            self.timeout = newHeartbeatTimeout(getTime());
+            self.setHeartbeatTimeout(getTime());
 
             return @intCast(self.log.items.len);
         }
 
         fn sendHeartbeat(self: *Self, time: u64) void {
-            for (0..self.server_no) |idx| {
-                if (idx == self.id) continue;
+            for (0..self.config.server_no) |idx| {
+                if (idx == self.config.id) continue;
                 self.sendAppendEntries(@intCast(idx));
             }
 
-            self.timeout = newHeartbeatTimeout(time);
+            self.setHeartbeatTimeout(time);
         }
 
         fn convertToCandidate(self: *Self, time: u64) void {
-            self.current_term += 1;
             self.state = .candidate;
-            self.voted_for = self.id;
+
+            self.setCurrentTerm(self.current_term + 1);
+            self.setVotedFor(self.config.id);
             for (self.received_votes) |*vote| {
                 vote.* = false;
             }
-            self.received_votes[self.id] = true;
+            self.received_votes[self.config.id] = true;
 
             log.info("Converted to candidate, term: {}", .{self.current_term});
 
-            for (0..self.server_no) |idx| {
-                if (idx == self.id) continue;
+            for (0..self.config.server_no) |idx| {
+                if (idx == self.config.id) continue;
                 self.sendRequestVote(@intCast(idx));
             }
 
-            self.timeout = newElectionTimeout(time);
+            self.setElectionTimeout(time);
         }
 
         fn convertToLeader(self: *Self) void {
@@ -198,7 +222,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             log.info("Converted to leader, term: {}", .{self.current_term});
 
             self.state = .leader;
-            self.current_leader = self.id;
+            self.current_leader = self.config.id;
             for (self.next_index, self.match_index) |*ni, *mi| {
                 ni.* = @as(u32, @intCast(self.log.items.len)) + 1;
                 mi.* = 0;
@@ -213,18 +237,18 @@ pub fn Raft(UserData: type, Entry: type) type {
             log.info("Converted to follower, term: {}", .{self.current_term});
 
             self.state = .follower;
-            self.voted_for = null;
-            self.timeout = newElectionTimeout(getTime());
+            self.setVotedFor(null);
+            self.setElectionTimeout(getTime());
         }
 
         fn sendRequestVote(self: *Self, to: u32) void {
-            assert(to != self.id);
-            assert(to < self.server_no);
+            assert(to != self.config.id);
+            assert(to < self.config.server_no);
             assert(self.state == .candidate);
 
             const request_vote = RequestVote{
                 .term = self.current_term,
-                .candidate_id = self.id,
+                .candidate_id = self.config.id,
                 .last_log_index = @intCast(self.log.items.len),
                 .last_log_term = if (self.log.getLastOrNull()) |last| last.term else 0,
             };
@@ -244,8 +268,8 @@ pub fn Raft(UserData: type, Entry: type) type {
         }
 
         fn sendAppendEntries(self: *Self, to: u32) void {
-            assert(to != self.id);
-            assert(to < self.server_no);
+            assert(to != self.config.id);
+            assert(to < self.config.server_no);
             assert(self.state == .leader);
 
             const prev_log_idx = self.next_index[to] - 1;
@@ -253,7 +277,7 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             const append_entries = AppendEntries{
                 .term = self.current_term,
-                .leader_id = self.id,
+                .leader_id = self.config.id,
                 .prev_log_index = prev_log_idx,
                 .prev_log_term = prev_log_term,
                 .entries = self.log.items[prev_log_idx..],
@@ -286,8 +310,8 @@ pub fn Raft(UserData: type, Entry: type) type {
         }
 
         fn handleRequestVote(self: *Self, msg: RequestVote) void {
-            assert(msg.candidate_id < self.server_no);
-            assert(msg.candidate_id != self.id);
+            assert(msg.candidate_id < self.config.server_no);
+            assert(msg.candidate_id != self.config.id);
 
             self.handleNewerTerm(msg.term);
 
@@ -326,19 +350,20 @@ pub fn Raft(UserData: type, Entry: type) type {
 
                 assert(self.state == .follower);
 
-                self.voted_for = msg.candidate_id;
+                self.setVotedFor(msg.candidate_id);
+
                 log.debug("Vote granted, term: {}", .{self.current_term});
                 break :blk true;
             };
 
             self.sendRequestVoteResponse(msg.candidate_id, vote_granted);
 
-            self.timeout = newElectionTimeout(getTime());
+            self.setElectionTimeout(getTime());
         }
 
         fn handleRequestVoteResponse(self: *Self, msg: RequestVoteResponse) void {
-            assert(msg.responder_id < self.server_no);
-            assert(msg.responder_id != self.id);
+            assert(msg.responder_id < self.config.server_no);
+            assert(msg.responder_id != self.config.id);
 
             self.handleNewerTerm(msg.term);
 
@@ -367,15 +392,15 @@ pub fn Raft(UserData: type, Entry: type) type {
             log.debug("Vote received: {}, votes: {}/{}", .{
                 msg.vote_granted,
                 total_votes,
-                self.server_no,
+                self.config.server_no,
             });
 
-            if (total_votes >= self.server_no / 2 + 1) self.convertToLeader();
+            if (total_votes >= self.config.server_no / 2 + 1) self.convertToLeader();
         }
 
         fn handleAppendEntries(self: *Self, msg: AppendEntries) void {
-            assert(msg.leader_id < self.server_no);
-            assert(msg.leader_id != self.id);
+            assert(msg.leader_id < self.config.server_no);
+            assert(msg.leader_id != self.config.id);
 
             self.handleNewerTerm(msg.term);
 
@@ -418,7 +443,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                         assert(msg.prev_log_term > self.commit_index);
 
                         // remove conflicting entries
-                        self.log.shrinkRetainingCapacity(msg.prev_log_index - 1);
+                        self.shrinkLog(msg.prev_log_index - 1);
                         log.debug("Entries not appended: conflicting entry at prev_index (local entry term  = {}), removing subsequent entries", .{entry.term});
                         break :blk false;
                     }
@@ -435,10 +460,8 @@ pub fn Raft(UserData: type, Entry: type) type {
                         // instead of the assert, we could just remove all of the following entries
                         assert(self.log.items[idx - 1].term == entry.term);
                     } else {
-                        self.log.append(entry) catch |err| {
-                            log.warn("Appending new entry to the log failed: {}", .{err});
-                            break :blk false;
-                        };
+                        self.appendLogEntry(entry);
+
                         log.info("Appended entry, term: {}, index: {}, entry: {}", .{ entry.term, self.log.items.len, entry.entry });
                     }
                 }
@@ -454,7 +477,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 const after_entries = msg.prev_log_index + msg.entries.len;
                 if (after_entries < self.log.items.len) {
                     if (self.log.items[after_entries].term < msg.term) {
-                        self.log.shrinkRetainingCapacity(after_entries);
+                        self.shrinkLog(after_entries);
                     }
                 }
                 // instead of doing that, we could remove entries in the for loop instead of the assert
@@ -473,12 +496,12 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.sendAppendEntriesResponse(msg.leader_id, success);
 
-            self.timeout = newElectionTimeout(getTime());
+            self.setElectionTimeout(getTime());
         }
 
         fn handleAppendEntriesResponse(self: *Self, msg: AppendEntriesResponse) void {
-            assert(msg.responder_id < self.server_no);
-            assert(msg.responder_id != self.id);
+            assert(msg.responder_id < self.config.server_no);
+            assert(msg.responder_id != self.config.id);
 
             self.handleNewerTerm(msg.term);
 
@@ -498,7 +521,11 @@ pub fn Raft(UserData: type, Entry: type) type {
                 return;
             }
 
-            // stale message
+            // FIXME: this makes it imposible to replicate the log on followers that rebooted but did not persist the log
+            // as they will respond will next_prev_index == 0 (bc their log will be empty after reboot)
+            // but our match_index will still indicate that the entries were replicated
+            // but if we remove this condition, we won't be able to handle AER out of order
+            // one idea is to resend AE with lowered next_index, but never decrement the match_index for that follower
             if (msg.next_prev_index < self.match_index[msg.responder_id]) {
                 log.debug("Ignoring AppendEntriesResponse: stale message (match index = {})", .{self.match_index[msg.responder_id]});
                 return;
@@ -536,7 +563,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                         if (repl_idx >= idx) votes += 1;
                     }
 
-                    if (votes >= self.server_no / 2 + 1) {
+                    if (votes >= self.config.server_no / 2 + 1) {
                         log.debug("Commit index changed from {} to {}", .{ self.commit_index, idx });
                         self.commit_index = @intCast(idx);
                     }
@@ -552,7 +579,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             if (msg_term > self.current_term) {
                 log.debug("Received message with term {}, which is greater than current term {}", .{ msg_term, self.current_term });
 
-                self.current_term = msg_term;
+                self.setCurrentTerm(msg_term);
                 self.convertToFollower();
             }
         }
@@ -561,7 +588,7 @@ pub fn Raft(UserData: type, Entry: type) type {
             const response = RequestVoteResponse{
                 .term = self.current_term,
                 .vote_granted = vote_granted,
-                .responder_id = self.id,
+                .responder_id = self.config.id,
             };
 
             const rpc = .{ .request_vote_response = response };
@@ -585,7 +612,7 @@ pub fn Raft(UserData: type, Entry: type) type {
                 // this always will be correct value matching the definition at the begining of
                 // the Raft struct
                 .next_prev_index = @intCast(self.log.items.len),
-                .responder_id = self.id,
+                .responder_id = self.config.id,
             };
 
             const rpc = .{ .append_entries_response = response };
@@ -602,27 +629,66 @@ pub fn Raft(UserData: type, Entry: type) type {
             });
         }
 
+        fn setCurrentTerm(self: *Self, new_current_term: u32) void {
+            self.current_term = new_current_term;
+            self.callbacks.persistCurrentTerm(self.callbacks.user_data, new_current_term) catch |err| {
+                std.debug.panic("Persisting current_term {} failed: {}", .{ new_current_term, err });
+            };
+        }
+
+        fn setVotedFor(self: *Self, new_voted_for: ?u32) void {
+            self.voted_for = new_voted_for;
+            self.callbacks.persistVotedFor(self.callbacks.user_data, new_voted_for) catch |err| {
+                std.debug.panic("Persisting voted_for {any} failed: {}", .{ new_voted_for, err });
+            };
+        }
+
+        fn appendLogEntry(self: *Self, entry: LogEntry) void {
+            self.log.append(entry) catch |err| {
+                std.debug.panic("Appending entry to the in-memory log failed: {}", .{err});
+            };
+
+            self.callbacks.logAppend(self.callbacks.user_data, entry) catch |err| {
+                std.debug.panic("Appending antry {} failed: {}", .{ entry, err });
+            };
+        }
+
+        fn shrinkLog(self: *Self, new_len: usize) void {
+            assert(new_len <= self.log.items.len);
+
+            var len = self.log.items.len;
+            while (len > new_len) : (len -= 1) {
+                const entry = self.callbacks.logPop(self.callbacks.user_data) catch |err| {
+                    std.debug.panic("Popping entry failed: {}", .{err});
+                };
+
+                assert(entry.term == self.log.items[len - 1].term);
+            }
+
+            self.log.shrinkRetainingCapacity(new_len);
+        }
+
         fn applyEntries(self: *Self) void {
             while (self.commit_index > self.last_applied) {
                 self.last_applied += 1;
                 const entry = self.log.items[self.last_applied - 1].entry;
                 self.callbacks.applyEntry(self.callbacks.user_data, entry) catch |err| {
-                    std.debug.panic("Applying new entry {} failed: {}\n", .{ entry, err });
+                    std.debug.panic("Applying new entry {} failed: {}", .{ entry, err });
                 };
 
                 log.info("Applied entry with index {}", .{self.last_applied});
             }
         }
 
-        fn newElectionTimeout(time: u64) u64 {
-            const start = default_timeout;
-            const stop = 2 * default_timeout;
+        fn setElectionTimeout(self: *Self, time: u64) void {
+            const start = self.config.election_timeout;
+            const stop = 2 * self.config.election_timeout;
             const interval = std.crypto.random.intRangeAtMost(u64, start, stop);
-            return time + interval;
+            self.timeout = time + interval;
         }
 
-        fn newHeartbeatTimeout(time: u64) u64 {
-            return time + heartbeat_timeout;
+        fn setHeartbeatTimeout(self: *Self, time: u64) void {
+            self.timeout = time + self.config.heartbeat_timeout;
         }
     };
 }

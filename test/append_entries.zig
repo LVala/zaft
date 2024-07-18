@@ -3,19 +3,19 @@ const utils = @import("utils.zig");
 
 const testing = std.testing;
 
-const TestRPCs = utils.TestRPCs;
+const TestUserData = utils.TestUserData;
 const TestRaft = utils.TestRaft;
-const setupTestRaft = utils.setupTestRaft;
 
 fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, follower_log: []const TestRaft.LogEntry, first_common: u32) !void {
     // first_common is a log index (so starts at 1), not array index!
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, false);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, false);
     defer raft.deinit();
 
     const leader_id = 1;
 
-    for (follower_log) |entry| try raft.log.append(entry);
+    for (follower_log) |entry| try utils.appendTestEntry(&raft, entry);
     raft.current_term = follower_log[follower_log.len - 1].term;
 
     // we start with empty AppendEntries
@@ -31,7 +31,7 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
         };
         raft.handleRPC(.{ .append_entries = ae });
 
-        switch (rpcs[leader_id]) {
+        switch (ud.rpcs[leader_id]) {
             .append_entries_response => |aer| {
                 const valid = if (idx == first_common + 1) aer.success else !aer.success;
                 try testing.expect(valid);
@@ -53,6 +53,8 @@ fn test_converge_logs(leader_log: []const TestRaft.LogEntry, leader_term: u32, f
     try testing.expect(raft.current_term == leader_term);
     try testing.expect(raft.commit_index == 2);
     try testing.expect(raft.last_applied == 2);
+
+    try utils.testPersistedMatch(&raft);
 }
 
 test "follower adds new entries from AppendEntries" {
@@ -167,8 +169,9 @@ test "follower replaces conflicting entires based on AppendEntries" {
 }
 
 test "stale AppendEntries does not shorten followers log" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, false);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, false);
     defer raft.deinit();
 
     const leader_id = 1;
@@ -185,7 +188,7 @@ test "stale AppendEntries does not shorten followers log" {
         .{ .term = 6, .entry = 8 },
     };
 
-    for (log[0..6]) |entry| try raft.log.append(entry);
+    for (log[0..6]) |entry| try utils.appendTestEntry(&raft, entry);
     raft.current_term = leader_term;
 
     // new leader has 2 new entries: log[6] and log[7]
@@ -202,7 +205,7 @@ test "stale AppendEntries does not shorten followers log" {
     };
     raft.handleRPC(.{ .append_entries = ae });
 
-    switch (rpcs[leader_id]) {
+    switch (ud.rpcs[leader_id]) {
         .append_entries_response => |aer| {
             try testing.expect(aer.success);
         },
@@ -229,7 +232,7 @@ test "stale AppendEntries does not shorten followers log" {
     };
     raft.handleRPC(.{ .append_entries = ae2 });
 
-    switch (rpcs[leader_id]) {
+    switch (ud.rpcs[leader_id]) {
         .append_entries_response => |aer| {
             try testing.expect(aer.success);
         },
@@ -247,8 +250,9 @@ test "stale AppendEntries does not shorten followers log" {
 }
 
 test "leader sends AppendEntries on initial entry" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
@@ -260,7 +264,7 @@ test "leader sends AppendEntries on initial entry" {
     }
 
     // initial AppendEntries heartbeat
-    for (rpcs[1..]) |rpc| {
+    for (ud.rpcs[1..]) |rpc| {
         switch (rpc) {
             .append_entries => |ae| {
                 try testing.expect(ae.term == initial_term);
@@ -283,8 +287,9 @@ test "leader sends AppendEntries on initial entry" {
 }
 
 test "leader handles AppendEntriesResponse" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
 
     const follower_id = 1;
@@ -301,7 +306,7 @@ test "leader handles AppendEntriesResponse" {
     };
 
     // pretend as if leader started with log in this state
-    for (log) |entry| try raft.log.append(entry);
+    for (log) |entry| try utils.appendTestEntry(&raft, entry);
     raft.current_term = 6;
     for (raft.next_index) |*ni| ni.* = 9;
     for (raft.match_index) |*mi| mi.* = 0;
@@ -318,7 +323,7 @@ test "leader handles AppendEntriesResponse" {
     };
     raft.handleRPC(.{ .append_entries_response = aer });
 
-    switch (rpcs[follower_id]) {
+    switch (ud.rpcs[follower_id]) {
         .append_entries => |ae| {
             try testing.expect(ae.prev_log_index == 7);
             try testing.expect(ae.prev_log_term == 5);
@@ -343,7 +348,7 @@ test "leader handles AppendEntriesResponse" {
     };
     raft.handleRPC(.{ .append_entries_response = aer2 });
 
-    switch (rpcs[follower_id]) {
+    switch (ud.rpcs[follower_id]) {
         .append_entries => |ae| {
             try testing.expect(ae.prev_log_index == 6);
             try testing.expect(ae.prev_log_term == 4);
@@ -359,7 +364,7 @@ test "leader handles AppendEntriesResponse" {
     }
 
     // some dummy value so we can later assert that the raft did not sent another AE
-    rpcs[follower_id] = .{ .request_vote_response = TestRaft.RequestVoteResponse{ .term = 0, .vote_granted = false, .responder_id = 0 } };
+    ud.rpcs[follower_id] = .{ .request_vote_response = TestRaft.RequestVoteResponse{ .term = 0, .vote_granted = false, .responder_id = 0 } };
 
     try testing.expect(raft.next_index[follower_id] == 7);
     try testing.expect(raft.match_index[follower_id] == 0);
@@ -372,7 +377,7 @@ test "leader handles AppendEntriesResponse" {
     };
     raft.handleRPC(.{ .append_entries_response = aer3 });
 
-    switch (rpcs[follower_id]) {
+    switch (ud.rpcs[follower_id]) {
         .append_entries => return error.TestUnexpectedResult,
         else => {},
     }
@@ -383,8 +388,9 @@ test "leader handles AppendEntriesResponse" {
 
 test "leader commits entries after replicating on majority of servers" {
     // we have 5 servers
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
 
     try testing.expect(raft.commit_index == 0);
@@ -422,8 +428,9 @@ test "leader commits entries after replicating on majority of servers" {
 
 test "leader does not commit entires from previous terms" {
     // we have 5 servers
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
 
     const log = [_]TestRaft.LogEntry{
@@ -440,7 +447,7 @@ test "leader does not commit entires from previous terms" {
     };
 
     // pretend as if leader started with log in this state
-    for (log) |entry| try raft.log.append(entry);
+    for (log) |entry| try utils.appendTestEntry(&raft, entry);
     raft.current_term = 6;
     raft.commit_index = 5;
     for (raft.next_index) |*ni| ni.* = 6;

@@ -3,10 +3,8 @@ const utils = @import("utils.zig");
 
 const testing = std.testing;
 
-const TestRPCs = utils.TestRPCs;
+const TestUserData = utils.TestUserData;
 const TestRaft = utils.TestRaft;
-const setupTestRaft = utils.setupTestRaft;
-const getTime = utils.getTime;
 
 // all of the tests in the `/test` folder test the Raft struct API
 // small unit tests can be kept close to the source
@@ -17,8 +15,9 @@ test {
 }
 
 test "converts to follower after receiving RPC with greater term" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
@@ -27,7 +26,6 @@ test "converts to follower after receiving RPC with greater term" {
     const rv = TestRaft.RequestVote{
         .term = initial_term + 1,
         .candidate_id = 1,
-        // TODO: dummy values
         .last_log_term = initial_term + 1,
         .last_log_index = 50,
     };
@@ -38,15 +36,16 @@ test "converts to follower after receiving RPC with greater term" {
 }
 
 test "leader sends heartbeats" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, true);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, true);
     defer raft.deinit();
     const initial_term = raft.current_term;
 
     try testing.expect(raft.state == .leader);
 
     // initial AppendEntries heartbeat
-    for (rpcs[1..]) |rpc| {
+    for (ud.rpcs[1..]) |rpc| {
         switch (rpc) {
             .append_entries => |ae| {
                 try testing.expect(ae.term == initial_term);
@@ -59,13 +58,13 @@ test "leader sends heartbeats" {
     }
 
     // clear messages (so we don't inspect stale messages later on)
-    rpcs = undefined;
+    ud.rpcs = undefined;
 
     // artificially skip timeout
-    raft.timeout = getTime() - 1;
+    raft.timeout = utils.getTime() - 1;
     _ = raft.tick();
 
-    for (rpcs[1..]) |rpc| {
+    for (ud.rpcs[1..]) |rpc| {
         switch (rpc) {
             .append_entries => |ae| {
                 try testing.expect(ae.term == initial_term);
@@ -79,12 +78,13 @@ test "leader sends heartbeats" {
 }
 
 test "follower respects heartbeats" {
-    var rpcs: TestRPCs = undefined;
-    var raft = setupTestRaft(&rpcs, false);
+    var ud = TestUserData.init(std.testing.allocator);
+    defer ud.deinit();
+    var raft = utils.setupTestRaft(&ud, false);
     defer raft.deinit();
 
     // skip timeout
-    raft.timeout = getTime() - 1;
+    raft.timeout = utils.getTime() - 1;
 
     const ae = TestRaft.AppendEntries{
         .leader_id = 1,
