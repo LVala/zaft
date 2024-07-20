@@ -18,7 +18,7 @@ pub fn Raft(UserData: type, Entry: type) type {
         };
 
         pub const InitialState = struct {
-            current_term: ?u32 = null,
+            current_term: u32 = 0,
             voted_for: ?u32 = null,
             log: []LogEntry = &.{},
         };
@@ -103,14 +103,12 @@ pub fn Raft(UserData: type, Entry: type) type {
         pub fn init(config: Config, initial_state: InitialState, callbacks: Callbacks, allocator: std.mem.Allocator) !Self {
             assert(config.id < config.server_no);
 
-            log.info("Initializing Raft, id: {}, number of servers: {}", .{ config.id, config.server_no });
-
             var self = Self{
                 .config = config,
                 .callbacks = callbacks,
                 .allocator = allocator,
                 .state = .follower,
-                .current_term = initial_state.current_term orelse 0,
+                .current_term = initial_state.current_term,
                 .voted_for = initial_state.voted_for,
                 .timeout = 0,
                 .log = std.ArrayList(LogEntry).init(allocator),
@@ -125,6 +123,14 @@ pub fn Raft(UserData: type, Entry: type) type {
 
             self.next_index[config.id] = @as(u32, @intCast(self.log.items.len)) + 1;
             self.match_index[config.id] = @intCast(self.log.items.len);
+
+            log.info("Initializing Raft, id: {}, number of servers: {}, term: {}, voted_for: {any}, log len: {}", .{
+                config.id,
+                config.server_no,
+                self.current_term,
+                self.voted_for,
+                self.log.items.len,
+            });
 
             self.setElectionTimeout(getTime());
 
