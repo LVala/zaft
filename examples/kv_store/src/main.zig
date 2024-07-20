@@ -2,6 +2,7 @@ const std = @import("std");
 const zaft = @import("zaft");
 const server = @import("server.zig");
 const Ticker = @import("ticker.zig").Ticker;
+const Storage = @import("storage.zig").Storage;
 
 const ClientServer = server.ClientServer;
 const RaftServer = server.RaftServer;
@@ -25,16 +26,15 @@ const UserData = struct {
     addresses: []const []const u8,
     store: *std.StringHashMap([]const u8),
     cond: *std.Thread.Condition,
+    storage: *Storage,
 };
 
 pub const Raft = zaft.Raft(UserData, Entry);
 
+// TODO: make these configurable
 const raft_addresses = [_][]const u8{ "127.0.0.1:10000", "127.0.0.1:10001", "127.0.0.1:10002" };
 const client_addresses = [_][]const u8{ "127.0.0.1:20000", "127.0.0.1:20001", "127.0.0.1:20002" };
-
-// const current_term_file = "current_term.txt";
-// const voted_for_file = "voted_for.txt";
-// const log_file = "log.txt";
+const cache_name = "zaft-cache";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -66,13 +66,26 @@ pub fn main() !void {
     var store = std.StringHashMap([]const u8).init(allocator);
     defer store.deinit();
 
+    var buffer: [128]u8 = undefined;
+    const cache_dir_name = try std.fmt.bufPrint(&buffer, "{s}-{}", .{ cache_name, self_id });
+    var storage = try Storage.init(cache_dir_name);
+    defer storage.deinit();
+
+    const readLog = try storage.readLog(allocator);
+    defer allocator.free(readLog);
+
     const config = Raft.Config{ .id = @intCast(self_id), .server_no = @intCast(raft_addresses.len) };
-    const initial_state = Raft.InitialState{};
+    const initial_state = Raft.InitialState{
+        .current_term = try storage.readCurrentTerm(),
+        .voted_for = try storage.readVotedFor(),
+        .log = readLog,
+    };
     var user_data = UserData{
         .allocator = allocator,
         .addresses = raft_http_addresses,
         .store = &store,
         .cond = &cond,
+        .storage = &storage,
     };
     const callbacks = Raft.Callbacks{
         .user_data = &user_data,
@@ -150,23 +163,19 @@ fn applyEntry(user_data: *UserData, entry: Entry) !void {
 }
 
 fn logAppend(ud: *UserData, log_entry: Raft.LogEntry) !void {
-    _ = ud;
-    _ = log_entry;
+    try ud.storage.appendLog(log_entry, ud.allocator);
 }
 
 fn logPop(ud: *UserData) !Raft.LogEntry {
-    _ = ud;
-    return Raft.LogEntry{ .term = 0, .entry = Entry{ .remove = Remove{ .key = "siema" } } };
+    return ud.storage.popLog(ud.allocator);
 }
 
 fn persistVotedFor(ud: *UserData, voted_for: ?u32) !void {
-    _ = ud;
-    _ = voted_for;
+    try ud.storage.writeVotedFor(voted_for);
 }
 
 fn persistCurrentTerm(ud: *UserData, current_term: u32) !void {
-    _ = ud;
-    _ = current_term;
+    try ud.storage.writeCurrentTerm(current_term);
 }
 
 fn parseAddress(address: []const u8) !std.net.Address {

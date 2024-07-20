@@ -6,3 +6,6 @@ zig-out/
 /build/
 /build-*/
 /docgen_tmp/
+
+# cache of the example kv_store
+zaft-cache-*/
