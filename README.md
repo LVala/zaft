@@ -15,7 +15,7 @@ for creating distributed systems requiring consensus among replicated state mach
 
 ## Installation
 
-This package can be installed using the Zig package manager. In your `build.zig.zon` add `zaft` to the dependency list:
+This package can be installed using the Zig package manager. In `build.zig.zon` add `zaft` to the dependency list:
 
 ```zig
 // in build.zig.zon
@@ -31,9 +31,9 @@ This package can be installed using the Zig package manager. In your `build.zig.
 }
 ```
 
-Output of `zig build` will provide you with valid hash, use it to replace the one above.
+The output of `zig build` will provide you with a valid hash, use it to replace the one above.
 
-Add the `zaft` module in you `build.zig`:
+Add the `zaft` module in `build.zig`:
 
 ```zig
 // in build.zig
@@ -74,7 +74,7 @@ defer raft.deinit();
 const config = Raft.Config{
     .id = 3,  // id of this Raft node
     .server_no = 5,  // total number of Raft nodes, there should be nodes with ids from 0 up to server_no-1
-    // there's other options with sane defaults, check out this struct's definition to learn
+    // there's other options with some sane defaults, check out this struct's definition to learn
     // what else can be configured
 };
 ```
@@ -103,7 +103,7 @@ fn applyEntry(ud: *UserData, entry: Entry) !void {
     }
 }
 
-// these two function have to append/pop entry to/from the log
+// these two functions have to append/pop entry to/from the log
 fn logAppend(ud: *UserData, log_entry: Raft.LogEntry) !void {
     try ud.database.appendEntry(log_entry);
 }
@@ -113,7 +113,7 @@ fn logPop(ud: *UserData) !Raft.LogEntry {
     return log_entry;
 }
 
-// these function are responsible for persisting values, that can be overriden on every save 
+// these functions are responsible for persisting values, that can be overridden on every save 
 fn persistCurrentTerm(ud: *UserData, current_term: u32) !void {
     try ud.database.persistCurrentTerm(current_term);
 }
@@ -127,7 +127,7 @@ fn persistVotedFor(ud: *UserData, voted_for: ?u32) !void {
 > Notice that all of the callbacks can return an error (mostly for the sake of convenience).
 >
 > Error returned from `makeRPC` will be ignored, the RPC will be simply retried after
-> an appropriate timeout. Errors returned from other function, as of now, will result in a panic.
+> an appropriate timeout. Errors returned from other functions, as of now, will result in a panic.
 
 ```zig
 // pointer to user_data will be passed as a first argument to all of the callbacks
@@ -153,11 +153,11 @@ const callbacks = Raft.Callbacks {
 ```
 
 * `initial_state` - the persisted state of this Raft node. On each reboot, you need to read the persisted Raft state
-(`current_term`, `voted_for`, and `log`, previouslt saved by the callbacks) and use it as the `InitialState`:
+(`current_term`, `voted_for`, and `log`, previously saved by the callbacks) and use it as the `InitialState`:
 
 ```zig
 const initial_state = Raft.InitialState {
-    // lets assume we saved the state to a persistent database of some kind
+    //let's assume we saved the state to a persistent database of some kind
     .voted_for = user_data.database.readVotedFor(),
     .current_term = user_data.database.readCurrentTerm(),
     .log = user_data.database.readLog(),
@@ -208,7 +208,7 @@ You can check which node is the leader by using `raft.getCurrentLeader()`. You c
 
 ## Next steps
 
-The library already can be successfully used, but there's plenty of room for improvements and new features, like:
+The library is fine to be used already, but there's plenty of room for improvements and new features, like:
 
 * Creating a simulator to test and find problems in the implementation.
 * Add auto-generated API documentation based on `zig build -femit-docs`.
